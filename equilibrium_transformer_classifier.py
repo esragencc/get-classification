@@ -49,33 +49,51 @@ class Attention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.dim = dim
 
+        # Initialize with small values for stability
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
+        
+        # Initialize weights with small values
+        nn.init.xavier_uniform_(self.qkv.weight, gain=0.01)
+        nn.init.xavier_uniform_(self.proj.weight, gain=0.01)
+        if self.qkv.bias is not None:
+            nn.init.zeros_(self.qkv.bias)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
 
     def forward(self, x):
         B, N, C = x.shape
         assert C == self.dim, f'Input dim {C} does not match layer dim {self.dim}'
         
+        # Ensure input is contiguous and in float32
+        x = x.contiguous().to(dtype=torch.float32)
+        
         # Compute QKV with shape (3, B, num_heads, N, head_dim)
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)  # Each has shape (B, num_heads, N, head_dim)
 
-        # Compute attention scores
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, num_heads, N, N)
+        # Compute attention scores with better numerical stability
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = attn - attn.max(dim=-1, keepdim=True)[0]  # Subtract max for stability
         attn = attn.softmax(dim=-1)
 
         # Apply attention to values
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)  # (B, N, C)
+        x = torch.matmul(attn, v)  # (B, num_heads, N, head_dim)
+        x = x.transpose(1, 2)  # (B, N, num_heads, head_dim)
+        x = x.reshape(B, N, C)  # (B, N, C)
         x = self.proj(x)
+        
         return x
 
 class GETBlock(nn.Module):
     """Transformer block with attention and MLP."""
     def __init__(self, dim, num_heads, mlp_ratio=4.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
         self.attn = Attention(dim, num_heads=num_heads)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
         
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
@@ -83,18 +101,27 @@ class GETBlock(nn.Module):
             nn.GELU(),
             nn.Linear(mlp_hidden_dim, dim)
         )
+        
+        # Initialize MLP with small values
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
         # Ensure input is float32 for numerical stability
         x = x.to(dtype=torch.float32)
         
-        # First normalization and attention
+        # First normalization and attention with residual
         x1 = self.norm1(x)
-        x = x + self.attn(x1)
+        attn_out = self.attn(x1)
+        x = x + 0.1 * attn_out  # Scale residual connection
         
-        # Second normalization and MLP
+        # Second normalization and MLP with residual
         x2 = self.norm2(x)
-        x = x + self.mlp(x2)
+        mlp_out = self.mlp(x2)
+        x = x + 0.1 * mlp_out  # Scale residual connection
         
         return x
 
