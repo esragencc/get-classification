@@ -307,14 +307,28 @@ def main():
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
     
-    # Load CIFAR-10
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                          download=args.rank == 0, transform=transform_train)
-    testset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                         download=args.rank == 0, transform=transform_test)
+    # Download dataset only on rank 0
+    if args.rank == 0:
+        print("Rank 0: Downloading CIFAR-10 dataset...")
+        trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                              download=True, transform=transform_train)
+        testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                             download=True, transform=transform_test)
+        print("Rank 0: Dataset download complete")
+    
+    # Make sure all processes wait for the data to be downloaded
+    if args.distributed:
+        dist.barrier()
+    
+    # Now all processes can load the dataset
+    if args.rank != 0:
+        trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                              download=False, transform=transform_train)
+        testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                             download=False, transform=transform_test)
     
     if args.distributed:
-        train_sampler = DistributedSampler(trainset)
+        train_sampler = DistributedSampler(trainset, shuffle=True)
         test_sampler = DistributedSampler(testset, shuffle=False)
     else:
         train_sampler = None
