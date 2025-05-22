@@ -95,46 +95,61 @@ class GETBlock(nn.Module):
     """Transformer block with attention and MLP."""
     def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.mlp_ratio = mlp_ratio
+        self.dropout = dropout
+        
+        # Layer norms for pre-normalization
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = Attention(dim, num_heads=num_heads, dropout=dropout)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
         
+        # Multi-head attention
+        self.attn = Attention(dim, num_heads=num_heads, dropout=dropout)
+        
+        # MLP layers
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_hidden_dim, dim),
-            nn.Dropout(dropout)
-        )
+        self.mlp_in = nn.Linear(dim, mlp_hidden_dim)
+        self.mlp_act = nn.GELU()
+        self.mlp_drop1 = nn.Dropout(dropout)
+        self.mlp_out = nn.Linear(mlp_hidden_dim, dim)
+        self.mlp_drop2 = nn.Dropout(dropout)
         
         # Initialize MLP with small values
-        for m in self.mlp.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.01)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        nn.init.normal_(self.mlp_in.weight, std=0.01)
+        nn.init.normal_(self.mlp_out.weight, std=0.01)
+        nn.init.zeros_(self.mlp_in.bias)
+        nn.init.zeros_(self.mlp_out.bias)
         
         # Learnable scaling for residual connections
         self.gamma1 = nn.Parameter(torch.ones(1) * 0.1)
         self.gamma2 = nn.Parameter(torch.ones(1) * 0.1)
 
+    def mlp_forward(self, x):
+        x = self.mlp_in(x)
+        x = self.mlp_act(x)
+        x = self.mlp_drop1(x)
+        x = self.mlp_out(x)
+        x = self.mlp_drop2(x)
+        return x
+
     def forward(self, x):
         # Ensure input is float32 for numerical stability
         x = x.to(dtype=torch.float32)
+        device = x.device
         
         # First normalization and attention with residual
         x1 = self.norm1(x)
         attn_out = self.attn(x1)
-        x = x + self.gamma1 * attn_out
+        x = x + self.gamma1.to(device) * attn_out
         
         # Second normalization and MLP with residual
         x2 = self.norm2(x)
-        mlp_out = self.mlp(x2)
-        x = x + self.gamma2 * mlp_out
+        mlp_out = self.mlp_forward(x2)
+        x = x + self.gamma2.to(device) * mlp_out
         
         # Clip values for stability
-        x = torch.clamp(x, -100, 100)
+        x = torch.clamp(x, -10, 10)
         
         return x
 
@@ -193,6 +208,7 @@ def anderson(f, x0, max_iter=50, m=5, lam=1e-4, threshold=50, eps=1e-5):
     # Calculate flattened size
     flat_size = x0.numel() // bsz
     
+    # Initialize tensors on the correct device
     X = torch.zeros(bsz, m, flat_size, dtype=dtype, device=device)
     F = torch.zeros(bsz, m, flat_size, dtype=dtype, device=device)
     
@@ -219,23 +235,35 @@ def anderson(f, x0, max_iter=50, m=5, lam=1e-4, threshold=50, eps=1e-5):
         try:
             # Use more stable solver with better conditioning
             alpha = torch.linalg.solve(H[:,:n+1,:n+1], y[:,:n+1])[:, 1:n+1, 0]
-        except RuntimeError:
-            # If solver fails, fall back to simple iteration
-            print(f"Warning: Solver failed at iteration {k}, falling back to simple iteration")
-            X[:,k%m] = F[:,k%m-1]
-            F[:,k%m] = f(X[:,k%m].reshape_as(x0)).contiguous().reshape(bsz, -1)
-            continue
             
-        # Update with computed coefficients
-        X[:,k%m] = (alpha[:,None] @ X[:,:n])[:,0]
-        F[:,k%m] = f(X[:,k%m].reshape_as(x0)).contiguous().reshape(bsz, -1)
+            # Ensure alpha values are reasonable
+            if torch.isnan(alpha).any() or torch.isinf(alpha).any():
+                raise RuntimeError("NaN or Inf in alpha values")
+                
+            # Update with computed coefficients
+            X[:,k%m] = (alpha[:,None] @ X[:,:n])[:,0]
+            
+        except RuntimeError as e:
+            print(f"Warning: Solver failed at iteration {k}, falling back to simple iteration")
+            print(f"Error: {str(e)}")
+            X[:,k%m] = F[:,k%m-1]
+            
+        # Apply function and reshape
+        try:
+            F[:,k%m] = f(X[:,k%m].reshape_as(x0)).contiguous().reshape(bsz, -1)
+        except RuntimeError as e:
+            print(f"Warning: Function application failed at iteration {k}")
+            print(f"Error: {str(e)}")
+            break
+            
+        # Compute relative error with better numerical stability
+        diff_norm = torch.norm(F[:,k%m] - X[:,k%m], dim=1)
+        denom = torch.norm(F[:,k%m], dim=1)
+        rel_diff = diff_norm / (eps + denom)
+        res.append(rel_diff.mean().item())
         
-        # Compute relative error
-        res_k = (F[:,k%m] - X[:,k%m]).norm().item()
-        denom = F[:,k%m].norm().item()
-        res.append(res_k / (eps + denom))  # Avoid division by zero
-        
-        if (res[-1] < eps) or (k >= threshold):
+        # Check convergence
+        if res[-1] < eps or k >= threshold:
             break
             
     return X[:,k%m].reshape_as(x0), res
