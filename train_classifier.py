@@ -150,7 +150,7 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, args):
+def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, args, epoch):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -166,7 +166,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ar
     backward_times = []
     
     end = time.time()
-    pbar = tqdm(train_loader, desc='Training', disable=not args.rank == 0)
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}', disable=not args.rank == 0)
     for batch_idx, (inputs, targets) in enumerate(pbar):
         data_time = time.time() - end
         data_times.append(data_time)
@@ -389,7 +389,7 @@ def main():
         
         # Train
         train_loss, train_acc, timing_stats = train_epoch(model, trainloader, criterion, 
-                                                         optimizer, scheduler, device, args)
+                                                         optimizer, scheduler, device, args, epoch)
         
         # Evaluate
         test_loss, test_acc = evaluate(model, testloader, criterion, device, args)
