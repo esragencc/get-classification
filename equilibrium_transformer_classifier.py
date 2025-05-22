@@ -40,7 +40,7 @@ class PatchEmbed(nn.Module):
 
 class Attention(nn.Module):
     """Multi-head self attention."""
-    def __init__(self, dim, num_heads=8):
+    def __init__(self, dim, num_heads=8, dropout=0.1):
         super().__init__()
         assert dim % num_heads == 0, f'dim {dim} should be divisible by num_heads {num_heads}'
         
@@ -48,18 +48,18 @@ class Attention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.dim = dim
+        self.dropout = dropout
 
         # Initialize with small values for stability
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(dropout)
         
         # Initialize weights with small values
-        nn.init.xavier_uniform_(self.qkv.weight, gain=0.01)
-        nn.init.xavier_uniform_(self.proj.weight, gain=0.01)
-        if self.qkv.bias is not None:
-            nn.init.zeros_(self.qkv.bias)
-        if self.proj.bias is not None:
-            nn.init.zeros_(self.proj.bias)
+        nn.init.normal_(self.qkv.weight, std=0.01)
+        nn.init.normal_(self.proj.weight, std=0.01)
+        nn.init.zeros_(self.qkv.bias)
+        nn.init.zeros_(self.proj.bias)
 
     def forward(self, x):
         B, N, C = x.shape
@@ -68,46 +68,56 @@ class Attention(nn.Module):
         # Ensure input is contiguous and in float32
         x = x.contiguous().to(dtype=torch.float32)
         
-        # Compute QKV with shape (3, B, num_heads, N, head_dim)
-        qkv = self.qkv(x)
+        # Compute QKV
+        qkv = self.qkv(x)  # (B, N, 3*C)
         qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, N, head_dim)
         q, k, v = qkv.unbind(0)  # Each has shape (B, num_heads, N, head_dim)
 
         # Compute attention scores with better numerical stability
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn - attn.max(dim=-1, keepdim=True)[0]  # Subtract max for stability
+        attn = torch.matmul(q / self.scale, k.transpose(-2, -1))  # (B, num_heads, N, N)
         attn = attn.softmax(dim=-1)
+        attn = torch.nn.functional.dropout(attn, p=self.dropout, training=self.training)
 
         # Apply attention to values
         x = torch.matmul(attn, v)  # (B, num_heads, N, head_dim)
-        x = x.transpose(1, 2)  # (B, N, num_heads, head_dim)
-        x = x.reshape(B, N, C)  # (B, N, C)
+        x = x.transpose(1, 2).reshape(B, N, C)  # (B, N, C)
         x = self.proj(x)
+        x = self.proj_drop(x)
+        
+        # Clip gradients for stability
+        if x.requires_grad:
+            x.register_hook(lambda grad: torch.clamp(grad, -1, 1))
         
         return x
 
 class GETBlock(nn.Module):
     """Transformer block with attention and MLP."""
-    def __init__(self, dim, num_heads, mlp_ratio=4.0):
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = Attention(dim, num_heads=num_heads)
+        self.attn = Attention(dim, num_heads=num_heads, dropout=dropout)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
         
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_hidden_dim),
             nn.GELU(),
-            nn.Linear(mlp_hidden_dim, dim)
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(dropout)
         )
         
         # Initialize MLP with small values
         for m in self.mlp.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                nn.init.normal_(m.weight, std=0.01)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        
+        # Learnable scaling for residual connections
+        self.gamma1 = nn.Parameter(torch.ones(1) * 0.1)
+        self.gamma2 = nn.Parameter(torch.ones(1) * 0.1)
 
     def forward(self, x):
         # Ensure input is float32 for numerical stability
@@ -116,12 +126,15 @@ class GETBlock(nn.Module):
         # First normalization and attention with residual
         x1 = self.norm1(x)
         attn_out = self.attn(x1)
-        x = x + 0.1 * attn_out  # Scale residual connection
+        x = x + self.gamma1 * attn_out
         
         # Second normalization and MLP with residual
         x2 = self.norm2(x)
         mlp_out = self.mlp(x2)
-        x = x + 0.1 * mlp_out  # Scale residual connection
+        x = x + self.gamma2 * mlp_out
+        
+        # Clip values for stability
+        x = torch.clamp(x, -100, 100)
         
         return x
 
@@ -242,6 +255,7 @@ class GETClassifier(nn.Module):
         num_heads=16,
         mlp_ratio=4.0,
         num_classes=10,
+        dropout=0.1,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -249,6 +263,7 @@ class GETClassifier(nn.Module):
         self.num_heads = num_heads
         self.deq_depth = deq_depth
         self.num_classes = num_classes
+        self.dropout = dropout
 
         # Patch embedding
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
@@ -256,17 +271,21 @@ class GETClassifier(nn.Module):
         
         # Positional embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        
+        # Dropout after embedding
+        self.pos_drop = nn.Dropout(dropout)
 
         # DEQ blocks
         self.deq_blocks = nn.ModuleList([
-            GETBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio)
+            GETBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, dropout=dropout)
             for _ in range(deq_depth)
         ])
         
         # Classification head
-        self.norm = nn.LayerNorm(hidden_size)
+        self.norm = nn.LayerNorm(hidden_size, eps=1e-6)
         self.head = nn.Linear(hidden_size, num_classes)
-
+        
+        # Initialize weights
         self.initialize_weights()
         
         # DEQ parameters
@@ -318,6 +337,7 @@ class GETClassifier(nn.Module):
         # Patch embedding + positional embedding
         x = self.x_embedder(x)
         x = x + self.pos_embed.to(device=device, dtype=x.dtype)
+        x = self.pos_drop(x)
         
         # DEQ forward function
         def func(z):
