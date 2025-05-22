@@ -110,14 +110,40 @@ def setup_distributed(args):
         args.distributed = False
         return
 
+    # Print debug information
+    print(f"[Rank {args.rank}] Initializing process group")
+    print(f"[Rank {args.rank}] world_size: {args.world_size}")
+    print(f"[Rank {args.rank}] rank: {args.rank}")
+    print(f"[Rank {args.rank}] local_rank: {args.local_rank}")
+    print(f"[Rank {args.rank}] master_addr: {os.environ.get('MASTER_ADDR', 'Not set')}")
+    print(f"[Rank {args.rank}] master_port: {os.environ.get('MASTER_PORT', 'Not set')}")
+
     args.distributed = True
     torch.cuda.set_device(args.local_rank)
     args.dist_backend = 'nccl'
-    print(f'| distributed init (rank {args.rank})', flush=True)
-    dist.init_process_group(
-        backend=args.dist_backend, init_method=args.dist_url,
-        world_size=args.world_size, rank=args.rank)
-    dist.barrier()
+    
+    # Initialize process group with a timeout
+    max_retries = 3
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            print(f"[Rank {args.rank}] Attempting to initialize process group (attempt {retry_count + 1}/{max_retries})")
+            dist.init_process_group(
+                backend=args.dist_backend,
+                init_method='env://',
+                timeout=timedelta(minutes=1)
+            )
+            print(f"[Rank {args.rank}] Successfully initialized process group")
+            break
+        except Exception as e:
+            retry_count += 1
+            print(f"[Rank {args.rank}] Failed to initialize process group (attempt {retry_count}/{max_retries})")
+            print(f"[Rank {args.rank}] Error: {str(e)}")
+            if retry_count == max_retries:
+                raise
+            time.sleep(10)  # Wait before retrying
+    
+    dist.barrier()  # Synchronize all processes
 
 def cleanup_distributed():
     """Cleanup distributed training resources."""
