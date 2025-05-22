@@ -256,8 +256,8 @@ class GETClassifier(nn.Module):
                 z = block(z)
             return z
         
-        # Equilibrium transformer
-        z = torch.randn_like(x)
+        # Initialize z with the input embedding
+        z = x.clone().detach()  # Start from the input embedding
         z_out, res = anderson(
             func, z,
             max_iter=self.max_iter,
