@@ -171,7 +171,18 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ar
     backward_times = []
     
     end = time.time()
-    pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}', disable=not args.rank == 0)
+    
+    # Create progress bar with better formatting
+    if args.rank == 0:
+        pbar = tqdm(
+            train_loader,
+            desc=f'Epoch {epoch+1}/{args.epochs}',
+            bar_format='{l_bar}{bar:20}{r_bar}',
+            dynamic_ncols=True
+        )
+    else:
+        pbar = train_loader
+        
     for batch_idx, (inputs, targets) in enumerate(pbar):
         data_time = time.time() - end
         data_times.append(data_time)
@@ -212,14 +223,25 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ar
         batch_times.append(batch_time)
         end = time.time()
         
-        # Update progress bar on main process
-        if args.rank == 0:
-            pbar.set_postfix({
-                'loss': total_loss / (batch_idx + 1),
-                'acc': 100. * correct / total,
-                'batch_time': f'{np.mean(batch_times):.3f}s',
-                'data_time': f'{np.mean(data_times):.3f}s'
-            })
+        # Update progress bar on main process with better formatting
+        if args.rank == 0 and isinstance(pbar, tqdm):
+            avg_loss = total_loss / (batch_idx + 1)
+            avg_acc = 100. * correct / total
+            avg_batch_time = np.mean(batch_times[-100:]) if batch_times else 0  # Last 100 batches
+            avg_data_time = np.mean(data_times[-100:]) if data_times else 0
+            
+            # Format metrics for better readability
+            metrics = {
+                'Loss': f'{avg_loss:.4f}',
+                'Acc': f'{avg_acc:.2f}%',
+                'Time': f'{avg_batch_time:.3f}s',
+                'Data': f'{avg_data_time:.3f}s',
+                'LR': f'{scheduler.get_last_lr()[0]:.6f}'
+            }
+            
+            # Create a clean metrics string
+            metrics_str = ' | '.join(f'{k}: {v}' for k, v in metrics.items())
+            pbar.set_postfix_str(metrics_str)
     
     scheduler.step()
     
@@ -378,23 +400,26 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = get_scheduler(optimizer, args.warmup_epochs, args.epochs)
     
-    # Training loop
+    # Training loop with better formatting
     best_acc = 0
     total_train_time = 0
     
     if args.rank == 0:
-        print("\nStarting training...")
-        print(f"Total epochs: {args.epochs}")
-        print(f"Batches per epoch: {len(trainloader)}")
-        print(f"Batch size per GPU: {args.batch_size}")
-        print(f"Total batch size: {args.batch_size * (dist.get_world_size() if args.distributed else 1)}\n")
+        print("\n" + "="*80)
+        print("Starting Training".center(80))
+        print(f"Total epochs: {args.epochs}".center(80))
+        print(f"Batches per epoch: {len(trainloader)}".center(80))
+        print(f"Batch size per GPU: {args.batch_size}".center(80))
+        print(f"Total batch size: {args.batch_size * (dist.get_world_size() if args.distributed else 1)}".center(80))
+        print("="*80 + "\n")
     
     for epoch in range(args.epochs):
         epoch_start = time.time()
         
         if args.rank == 0:
-            print(f'\nEpoch: {epoch+1}/{args.epochs}')
-            print(f'Started at: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+            print(f"\nEpoch {epoch+1}/{args.epochs}".center(80, '-'))
+            print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}".center(80))
+            print('-'*80)
         
         # Train
         train_loss, train_acc, timing_stats = train_epoch(model, trainloader, criterion, 
@@ -410,20 +435,32 @@ def main():
         estimated_remaining = avg_epoch_time * (args.epochs - epoch - 1)
         
         if args.rank == 0:
-            print(f'\nEpoch Statistics:')
-            print(f'Train Loss: {train_loss:.3f} | Train Acc: {train_acc:.3f}%')
-            print(f'Test Loss: {test_loss:.3f} | Test Acc: {test_acc:.3f}%')
-            print(f'\nTiming Information:')
-            print(f'Epoch time: {epoch_time:.2f}s')
-            print(f'Average batch time: {timing_stats["batch_time"]:.3f}s')
-            print(f'Average data time: {timing_stats["data_time"]:.3f}s')
-            print(f'Average forward time: {timing_stats["forward_time"]:.3f}s')
-            print(f'Average backward time: {timing_stats["backward_time"]:.3f}s')
-            print(f'Estimated time remaining: {str(timedelta(seconds=int(estimated_remaining)))}')
+            # Print epoch summary with better formatting
+            print('\n' + '-'*80)
+            print('Epoch Summary'.center(80))
+            print('-'*80)
             
-            # Save checkpoint
+            # Training metrics
+            print('\nTraining:')
+            print(f"Loss: {train_loss:.4f} | Accuracy: {train_acc:.2f}%")
+            
+            # Testing metrics
+            print('\nValidation:')
+            print(f"Loss: {test_loss:.4f} | Accuracy: {test_acc:.2f}%")
+            
+            # Timing information
+            print('\nTiming Information:')
+            print(f"Epoch time: {str(timedelta(seconds=int(epoch_time)))}")
+            print(f"Average batch time: {timing_stats['batch_time']:.3f}s")
+            print(f"Average data time: {timing_stats['data_time']:.3f}s")
+            print(f"Average forward time: {timing_stats['forward_time']:.3f}s")
+            print(f"Average backward time: {timing_stats['backward_time']:.3f}s")
+            print(f"Estimated time remaining: {str(timedelta(seconds=int(estimated_remaining)))}")
+            
+            # Save checkpoint if improved
             if test_acc > best_acc:
-                print(f'\nSaving checkpoint... Best accuracy improved from {best_acc:.3f} to {test_acc:.3f}')
+                print('\nCheckpoint:')
+                print(f"Best accuracy improved from {best_acc:.2f}% to {test_acc:.2f}%")
                 state = {
                     'model': model.module.state_dict() if args.distributed else model.state_dict(),
                     'acc': test_acc,
@@ -432,12 +469,16 @@ def main():
                 }
                 torch.save(state, f'{args.output_dir}/best_classifier.pth')
                 best_acc = test_acc
+            
+            print('-'*80 + '\n')
     
     if args.rank == 0:
-        print("\nTraining completed!")
-        print(f"Total training time: {str(timedelta(seconds=int(total_train_time)))}")
-        print(f"Average epoch time: {str(timedelta(seconds=int(avg_epoch_time)))}")
-        print(f"Best test accuracy: {best_acc:.2f}%")
+        print("="*80)
+        print("Training Complete".center(80))
+        print(f"Total training time: {str(timedelta(seconds=int(total_train_time)))}".center(80))
+        print(f"Average epoch time: {str(timedelta(seconds=int(avg_epoch_time)))}".center(80))
+        print(f"Best test accuracy: {best_acc:.2f}%".center(80))
+        print("="*80 + "\n")
     
     # Cleanup
     cleanup_distributed()
