@@ -6,215 +6,186 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as transforms
-from torchdeq import get_deq
-import argparse
+import numpy as np
 from tqdm import tqdm
+from equilibrium_transformer_classifier import GETClassifier
 
-from equilibrium_transformer_classifier import EquilibriumClassifier
-
-def get_args():
-    parser = argparse.ArgumentParser(description='Train Equilibrium Transformer on CIFAR')
-    
+# Default configuration
+config = {
     # Model parameters
-    parser.add_argument('--hidden-size', type=int, default=384,
-                        help='Hidden dimension size')
-    parser.add_argument('--num-heads', type=int, default=6,
-                        help='Number of attention heads')
-    parser.add_argument('--deq-depth', type=int, default=3,
-                        help='Number of DEQ blocks')
-    parser.add_argument('--patch-size', type=int, default=4,
-                        help='Size of image patches')
-    parser.add_argument('--mlp-ratio', type=float, default=4.0,
-                        help='MLP expansion ratio')
+    'hidden_size': 384,
+    'deq_depth': 3,
+    'num_heads': 6,
+    'mlp_ratio': 4.0,
     
     # Training parameters
-    parser.add_argument('--batch-size', type=int, default=128,
-                        help='Batch size for training')
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of epochs to train')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                        help='Learning rate')
-    parser.add_argument('--weight-decay', type=float, default=0.05,
-                        help='Weight decay')
-    parser.add_argument('--warmup-epochs', type=int, default=5,
-                        help='Number of warmup epochs')
+    'batch_size': 128,
+    'epochs': 200,
+    'lr': 0.001,
+    'weight_decay': 0.05,
+    'warmup_epochs': 5,
     
     # DEQ parameters
-    parser.add_argument('--f-thres', type=int, default=24,
-                        help='Forward threshold for DEQ solver')
-    parser.add_argument('--b-thres', type=int, default=24,
-                        help='Backward threshold for DEQ solver')
-    parser.add_argument('--mem', action='store_true',
-                        help='Use memory efficient computation')
+    'f_solver': 'anderson',
+    'f_thres': 30,
+    'f_eps': 1e-5,
+    'f_solver_eps': 1e-5,
+    'stop_mode': 'rel',
+    'anderson_m': 5,
+    'beta': 1.0,
     
-    # Other parameters
-    parser.add_argument('--device', default='cuda',
-                        help='Device to use for training')
-    parser.add_argument('--num-workers', type=int, default=4,
-                        help='Number of data loading workers')
-    parser.add_argument('--save-dir', default='checkpoints',
-                        help='Directory to save checkpoints')
-    
-    return parser.parse_args()
+    # Device and output parameters
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'output_dir': 'checkpoints',
+    'seed': 42
+}
 
-def get_cifar10_loaders(args):
-    # Data augmentation and normalization for training
-    # Just normalization for validation
+def set_seed(seed):
+    """Set random seed for reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def get_scheduler(optimizer, warmup_epochs, epochs):
+    """Get cosine scheduler with warmup."""
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return float(epoch) / float(max(1, warmup_epochs))
+        return 0.5 * (1.0 + np.cos(np.pi * float(epoch - warmup_epochs) / float(epochs - warmup_epochs)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+def train_epoch(model, train_loader, criterion, optimizer, scheduler, device):
+    """Train for one epoch."""
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    pbar = tqdm(train_loader, desc='Training')
+    for batch_idx, (inputs, targets) in enumerate(pbar):
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        
+        # Forward pass
+        outputs = model(inputs)
+        
+        # Handle multiple outputs during training (fixed point correction)
+        if isinstance(outputs, list):
+            loss = sum(criterion(output, targets) for output in outputs) / len(outputs)
+            outputs = outputs[-1]  # Use last output for accuracy calculation
+        else:
+            loss = criterion(outputs, targets)
+        
+        # Backward pass
+        loss.backward()
+        optimizer.step()
+        
+        # Statistics
+        total_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': total_loss / (batch_idx + 1),
+            'acc': 100. * correct / total
+        })
+    
+    scheduler.step()
+    return total_loss / len(train_loader), 100. * correct / total
+
+def evaluate(model, test_loader, criterion, device):
+    """Evaluate the model."""
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for inputs, targets in test_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+    
+    return total_loss / len(test_loader), 100. * correct / total
+
+def main():
+    # Set seed and create output directory
+    set_seed(config['seed'])
+    os.makedirs(config['output_dir'], exist_ok=True)
+    
+    # Data augmentation and normalization
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
-
-    transform_val = transforms.Compose([
+    
+    transform_test = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
-
-    trainset = torchvision.datasets.CIFAR10(
-        root='./data', train=True, download=True, transform=transform_train)
-    trainloader = DataLoader(
-        trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-
-    valset = torchvision.datasets.CIFAR10(
-        root='./data', train=False, download=True, transform=transform_val)
-    valloader = DataLoader(
-        valset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-
-    return trainloader, valloader
-
-def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-6):
-    def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        return max(min_lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-def train_one_epoch(model, trainloader, criterion, optimizer, scheduler, deq_solver, device):
-    model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
     
-    pbar = tqdm(trainloader, desc='Training')
-    for batch_idx, (inputs, targets) in enumerate(pbar):
-        inputs, targets = inputs.to(device), targets.to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(inputs, deq_solver)
-        loss = criterion(outputs, targets)
-        
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-        
-        total_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
-        
-        pbar.set_postfix({
-            'loss': total_loss/(batch_idx+1),
-            'acc': 100.*correct/total
-        })
+    # Load CIFAR-10
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                          download=True, transform=transform_train)
+    trainloader = DataLoader(trainset, batch_size=config['batch_size'],
+                           shuffle=True, num_workers=2)
     
-    return total_loss/len(trainloader), 100.*correct/total
-
-@torch.no_grad()
-def evaluate(model, valloader, criterion, deq_solver, device):
-    model.eval()
-    total_loss = 0
-    correct = 0
-    total = 0
-    
-    for inputs, targets in tqdm(valloader, desc='Evaluating'):
-        inputs, targets = inputs.to(device), targets.to(device)
-        
-        outputs = model(inputs, deq_solver)
-        loss = criterion(outputs, targets)
-        
-        total_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
-    
-    return total_loss/len(valloader), 100.*correct/total
-
-def main():
-    args = get_args()
-    
-    # Create save directory
-    os.makedirs(args.save_dir, exist_ok=True)
-    
-    # Set device
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    
-    # Get data loaders
-    trainloader, valloader = get_cifar10_loaders(args)
+    testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                         download=True, transform=transform_test)
+    testloader = DataLoader(testset, batch_size=config['batch_size'],
+                          shuffle=False, num_workers=2)
     
     # Create model
-    model = EquilibriumClassifier(
-        hidden_size=args.hidden_size,
-        num_heads=args.num_heads,
-        deq_depth=args.deq_depth,
-        patch_size=args.patch_size,
-        mlp_ratio=args.mlp_ratio,
-        mem_efficient=args.mem
-    ).to(device)
+    model = GETClassifier(
+        args=config,
+        hidden_size=config['hidden_size'],
+        deq_depth=config['deq_depth'],
+        num_heads=config['num_heads'],
+        mlp_ratio=config['mlp_ratio']
+    ).to(config['device'])
     
-    # Setup DEQ solver
-    deq_args = argparse.Namespace(
-        f_thres=args.f_thres,
-        b_thres=args.b_thres,
-        stop_mode="rel",
-        eps=1e-4
-    )
-    deq_solver = get_deq(deq_args)
-    
-    # Setup training
+    # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    
-    # Calculate total steps for scheduler
-    total_steps = len(trainloader) * args.epochs
-    warmup_steps = len(trainloader) * args.warmup_epochs
-    
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, warmup_steps, total_steps
-    )
+    optimizer = optim.AdamW(model.parameters(), lr=config['lr'], weight_decay=config['weight_decay'])
+    scheduler = get_scheduler(optimizer, config['warmup_epochs'], config['epochs'])
     
     # Training loop
     best_acc = 0
-    for epoch in range(args.epochs):
-        print(f'\nEpoch: {epoch+1}')
+    for epoch in range(config['epochs']):
+        print(f'\nEpoch: {epoch+1}/{config["epochs"]}')
         
         # Train
-        train_loss, train_acc = train_one_epoch(
-            model, trainloader, criterion, optimizer, scheduler, deq_solver, device
-        )
+        train_loss, train_acc = train_epoch(model, trainloader, criterion, 
+                                          optimizer, scheduler, config['device'])
         
         # Evaluate
-        val_loss, val_acc = evaluate(
-            model, valloader, criterion, deq_solver, device
-        )
-        
-        # Save checkpoint if best accuracy
-        if val_acc > best_acc:
-            print('Saving checkpoint...')
-            best_acc = val_acc
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'best_acc': best_acc,
-            }, os.path.join(args.save_dir, 'best_model.pth'))
+        test_loss, test_acc = evaluate(model, testloader, criterion, config['device'])
         
         print(f'Train Loss: {train_loss:.3f} | Train Acc: {train_acc:.3f}%')
-        print(f'Val Loss: {val_loss:.3f} | Val Acc: {val_acc:.3f}%')
+        print(f'Test Loss: {test_loss:.3f} | Test Acc: {test_acc:.3f}%')
+        
+        # Save checkpoint
+        if test_acc > best_acc:
+            print(f'Saving checkpoint... Best accuracy improved from {best_acc:.3f} to {test_acc:.3f}')
+            state = {
+                'model': model.state_dict(),
+                'acc': test_acc,
+                'epoch': epoch,
+                'config': config,
+            }
+            torch.save(state, f'{config["output_dir"]}/best_classifier.pth')
+            best_acc = test_acc
 
 if __name__ == '__main__':
     main() 

@@ -1,26 +1,97 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from timm.models.vision_transformer import PatchEmbed, Mlp
-from torchdeq import get_deq
-from torchdeq.norm import apply_norm, reset_norm
-from torchdeq.utils import mem_gc
+import math
+import numpy as np
+from typing import Tuple
 
+class PatchEmbed(nn.Module):
+    """
+    2D Image to Patch Embedding
+    """
+    def __init__(
+        self,
+        img_size: int = 32,
+        patch_size: int = 2,
+        in_chans: int = 3,
+        embed_dim: int = 384,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = (patch_size, patch_size)
+        self.grid_size = img_size // patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+
+        self.proj = nn.Conv2d(
+            in_chans, embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=bias
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        assert H == self.img_size and W == self.img_size, \
+            f"Input image size ({H}*{W}) doesn't match model ({self.img_size}*{self.img_size})."
+        
+        # (B, C, H, W) -> (B, D, H/P, W/P) -> (B, H/P * W/P, D)
+        x = self.proj(x).flatten(2).transpose(1, 2)
+        return x
+
+class Attention(nn.Module):
+    """Multi-head self attention."""
+    def __init__(self, dim, num_heads=8):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        return x
+
+class GETBlock(nn.Module):
+    """Transformer block with attention and MLP."""
+    def __init__(self, dim, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = Attention(dim, num_heads=num_heads)
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, dim)
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size):
     """
-    grid_size: int of the grid height and width
-    return: [grid_size*grid_size, embed_dim] positional embeddings
+    Create 2D sine-cosine positional embeddings.
     """
-    grid_h = torch.arange(grid_size, dtype=torch.float32)
-    grid_w = torch.arange(grid_size, dtype=torch.float32)
-    grid = torch.meshgrid(grid_w, grid_h)
-    grid = torch.stack(grid, dim=0)
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
 
     grid = grid.reshape([2, 1, grid_size, grid_size])
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
     return pos_embed
-
 
 def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     assert embed_dim % 2 == 0
@@ -29,9 +100,8 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
     emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
 
-    emb = torch.cat([emb_h, emb_w], dim=1) # (H*W, D)
+    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
     return emb
-
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
@@ -39,147 +109,109 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     pos: a list of positions to be encoded: size (M,)
     out: (M, D)
     """
-    omega = torch.arange(embed_dim // 2, dtype=torch.float64)
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
     omega /= embed_dim / 2.
     omega = 1. / 10000**omega  # (D/2,)
 
     pos = pos.reshape(-1)  # (M,)
-    out = pos.unsqueeze(-1) * omega.unsqueeze(0)  # (M, D/2)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
 
-    emb_sin = torch.sin(out) # (M, D/2)
-    emb_cos = torch.cos(out) # (M, D/2)
+    emb_sin = np.sin(out) # (M, D/2)
+    emb_cos = np.cos(out) # (M, D/2)
 
-    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
 
-
-class AttnInterface(nn.Module):
-    def __init__(
-            self,
-            dim,
-            num_heads=8,
-            qkv_bias=False,
-            qk_norm=False,
-            attn_drop=0.,
-            proj_drop=0.,
-            norm_layer=nn.LayerNorm
-    ):
-        super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.fast_attn = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x)
-        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+def anderson(f, x0, max_iter=50, m=5, lam=1e-4, threshold=50, eps=1e-5):
+    """ Anderson acceleration for fixed point iteration. """
+    bsz = x0.shape[0]
+    
+    # Make sure input is contiguous
+    x0 = x0.contiguous()
+    
+    # Calculate flattened size
+    flat_size = x0.numel() // bsz
+    
+    X = torch.zeros(bsz, m, flat_size, dtype=x0.dtype, device=x0.device)
+    F = torch.zeros(bsz, m, flat_size, dtype=x0.dtype, device=x0.device)
+    
+    # Initial steps with proper reshaping
+    X[:,0] = x0.reshape(bsz, -1)
+    F[:,0] = f(x0).contiguous().reshape(bsz, -1)
+    X[:,1] = F[:,0]
+    F[:,1] = f(F[:,0].reshape_as(x0)).contiguous().reshape(bsz, -1)
+    
+    H = torch.zeros(bsz, m+1, m+1, dtype=x0.dtype, device=x0.device)
+    H[:,0,1:] = H[:,1:,0] = 1
+    y = torch.zeros(bsz, m+1, 1, dtype=x0.dtype, device=x0.device)
+    y[:,0] = 1
+    
+    res = []
+    for k in range(2, max_iter):
+        n = min(k, m)
+        G = F[:,:n]-X[:,:n]
+        H[:,1:n+1,1:n+1] = torch.bmm(G,G.transpose(1,2)) + lam*torch.eye(n, dtype=x0.dtype,device=x0.device)[None]
         
-        q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
-
-        if self.fast_attn:
-            x = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p=self.attn_drop.p,
-            )
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = attn @ v
-
-        x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class EquilibriumBlock(nn.Module):
-    """
-    A Transformer block with equilibrium dynamics.
-    """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
-        super().__init__()
-        # Attention
-        self.norm1 = nn.LayerNorm(hidden_size, eps=1e-6)
-        self.attn = AttnInterface(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        # Use torch.linalg.solve instead of torch.solve
+        alpha = torch.linalg.solve(H[:,:n+1,:n+1], y[:,:n+1])[:, 1:n+1, 0]   # (bsz x n)
         
-        # MLP
-        self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=0)
- 
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
+        X[:,k%m] = (alpha[:,None] @ X[:,:n])[:,0]
+        F[:,k%m] = f(X[:,k%m].reshape_as(x0)).contiguous().reshape(bsz, -1)
+        res.append((F[:,k%m] - X[:,k%m]).norm().item()/(1e-5 + F[:,k%m].norm().item()))
+        if (res[-1] < eps) or (k >= threshold):
+            break
+    return X[:,k%m].reshape_as(x0), res
 
-
-class EquilibriumClassifier(nn.Module):
+class GETClassifier(nn.Module):
     """
-    Equilibrium Transformer for image classification.
-    Specifically adapted for CIFAR dataset.
+    Classification model with only Equilibrium Transformer backbone.
     """
     def __init__(
         self,
-        img_size=32,           # CIFAR image size
-        patch_size=4,          # Patch size for tokenization
-        in_channels=3,         # RGB images
-        num_classes=10,        # CIFAR-10 classes
-        hidden_size=384,       # Embedding dimension
-        deq_depth=3,          # Number of DEQ blocks
-        num_heads=6,          # Number of attention heads
-        mlp_ratio=4.0,        # MLP expansion ratio
-        mem_efficient=False,   # Memory efficient computation
+        args,
+        input_size=32,
+        patch_size=2,
+        in_channels=3,
+        hidden_size=1152,
+        deq_depth=3,
+        num_heads=16,
+        mlp_ratio=4.0,
+        num_classes=10,
     ):
         super().__init__()
-        self.hidden_size = hidden_size
+        self.in_channels = in_channels
+        self.patch_size = patch_size
+        self.num_heads = num_heads
         self.deq_depth = deq_depth
-        self.mem_efficient = mem_efficient
         self.num_classes = num_classes
 
         # Patch embedding
-        self.patch_embed = PatchEmbed(
-            img_size=img_size, 
-            patch_size=patch_size, 
-            in_chans=in_channels, 
-            embed_dim=hidden_size
-        )
-        
-        num_patches = self.patch_embed.num_patches
-        
-        # Add [CLS] token
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        num_patches = self.x_embedder.num_patches
         
         # Positional embedding
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches + 1, hidden_size),  # +1 for [CLS] token
-            requires_grad=False
-        )
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         # DEQ blocks
         self.deq_blocks = nn.ModuleList([
-            EquilibriumBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) 
+            GETBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio)
             for _ in range(deq_depth)
         ])
         
         # Classification head
         self.norm = nn.LayerNorm(hidden_size)
         self.head = nn.Linear(hidden_size, num_classes)
-        
-        # Initialize weights
+
         self.initialize_weights()
         
+        # DEQ parameters
+        self.max_iter = getattr(args, 'f_thres', 30)
+        self.stop_mode = getattr(args, 'stop_mode', 'rel')
+        self.eps = getattr(args, 'f_eps', 1e-5)
+        self.solver_eps = getattr(args, 'f_solver_eps', 1e-5)
+        self.anderson_m = getattr(args, 'anderson_m', 5)
+
     def initialize_weights(self):
         # Initialize transformer layers
         def _basic_init(module):
@@ -188,63 +220,55 @@ class EquilibriumClassifier(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
             if isinstance(module, nn.LayerNorm):
-                nn.init.constant_(module.weight, 1)
-                nn.init.constant_(module.bias, 0)
+                if module.weight is not None:
+                    nn.init.constant_(module.weight, 1)
+                    nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-        # Initialize [CLS] token
-        nn.init.normal_(self.cls_token, std=0.02)
-
-        # Initialize position embedding
+        # Initialize (and freeze) pos_embed by sin-cos embedding
         pos_embed = get_2d_sincos_pos_embed(
-            self.pos_embed.shape[-1],
-            int(self.patch_embed.num_patches ** 0.5)
+            self.pos_embed.shape[-1], 
+            int(self.x_embedder.num_patches ** 0.5)
         )
-        pos_embed = torch.cat([torch.zeros(1, self.pos_embed.shape[-1]), pos_embed])
-        self.pos_embed.data.copy_(pos_embed.unsqueeze(0))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
-    def forward(self, x, deq_solver=None):
-        """
-        Forward pass for classification.
-        Args:
-            x: Input images (B, C, H, W)
-            deq_solver: Deep equilibrium solver function
-        Returns:
-            logits: Classification logits (B, num_classes)
-        """
-        if deq_solver is None:
-            raise ValueError("deq_solver must be provided")
+        # Initialize patch embedding
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
 
-        # Patch embedding
-        x = self.patch_embed(x)
+        # Initialize classification head
+        nn.init.constant_(self.head.weight, 0)
+        nn.init.constant_(self.head.bias, 0)
+
+    def forward(self, x):
+        """
+        Forward pass of GET Classifier.
+        x: (B, C, H, W) tensor of spatial inputs (images)
+        Returns: (B, num_classes) tensor of class logits
+        """
+        # Patch embedding + positional embedding
+        x = self.x_embedder(x) + self.pos_embed     # (B, N, D)
         
-        # Add [CLS] token
-        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat([cls_token, x], dim=1)
-        
-        # Add position embedding
-        x = x + self.pos_embed
-        
+        # DEQ forward function
         def func(z):
             for block in self.deq_blocks:
-                if self.mem_efficient:
-                    z = mem_gc(block, (z,))
-                else:
-                    z = block(z)
+                z = block(z)
             return z
         
-        # Find fixed point
+        # Equilibrium transformer
         z = torch.randn_like(x)
-        z_out, _ = deq_solver(func, z)
-        
-        # Use the final equilibrium point
+        z_out, res = anderson(
+            func, z,
+            max_iter=self.max_iter,
+            m=self.anderson_m,
+            eps=self.eps,
+            threshold=self.max_iter
+        )
+
         if self.training:
-            x = z_out[-1]
+            # For fixed point correction, return logits for all iterations
+            return [self.head(self.norm(z_out[:, 0]))]
         else:
-            x = z_out[-1]
-            
-        # Classification from [CLS] token
-        x = self.norm(x[:, 0])
-        x = self.head(x)
-        
-        return x 
+            # For inference, return logits from final iteration
+            return self.head(self.norm(z_out[:, 0])) 
