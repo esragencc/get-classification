@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --nodes=1
 #SBATCH -J get_classifier                              # job name
-#SBATCH --chdir=/home/esragenc/get-main               # working directory
+#SBATCH --chdir=/home/esragenc/get-classification              # working directory
 #SBATCH --gres=gpu:2                                  # request 2 GPUs
 #SBATCH --output=/home/esragenc/get_classifier-%j.out # output file
 #SBATCH --error=/home/esragenc/get_classifier-%j.err  # error file
