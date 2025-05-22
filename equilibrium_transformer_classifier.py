@@ -42,22 +42,30 @@ class Attention(nn.Module):
     """Multi-head self attention."""
     def __init__(self, dim, num_heads=8):
         super().__init__()
+        assert dim % num_heads == 0, f'dim {dim} should be divisible by num_heads {num_heads}'
+        
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.dim = dim
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
 
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        assert C == self.dim, f'Input dim {C} does not match layer dim {self.dim}'
+        
+        # Compute QKV with shape (3, B, num_heads, N, head_dim)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # Each has shape (B, num_heads, N, head_dim)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        # Compute attention scores
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, num_heads, N, N)
         attn = attn.softmax(dim=-1)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # Apply attention to values
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)  # (B, N, C)
         x = self.proj(x)
         return x
 
@@ -68,6 +76,7 @@ class GETBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.attn = Attention(dim, num_heads=num_heads)
         self.norm2 = nn.LayerNorm(dim)
+        
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_hidden_dim),
@@ -76,8 +85,17 @@ class GETBlock(nn.Module):
         )
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        # Ensure input is float32 for numerical stability
+        x = x.to(dtype=torch.float32)
+        
+        # First normalization and attention
+        x1 = self.norm1(x)
+        x = x + self.attn(x1)
+        
+        # Second normalization and MLP
+        x2 = self.norm2(x)
+        x = x + self.mlp(x2)
+        
         return x
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size):
@@ -266,8 +284,13 @@ class GETClassifier(nn.Module):
         x: (B, C, H, W) tensor of spatial inputs (images)
         Returns: (B, num_classes) tensor of class logits
         """
+        # Ensure input is on the correct device and dtype
+        x = x.to(dtype=torch.float32)
+        device = x.device
+        
         # Patch embedding + positional embedding
-        x = self.x_embedder(x) + self.pos_embed     # (B, N, D)
+        x = self.x_embedder(x)
+        x = x + self.pos_embed.to(device=device, dtype=x.dtype)
         
         # DEQ forward function
         def func(z):
@@ -276,7 +299,7 @@ class GETClassifier(nn.Module):
             return z
         
         # Initialize z with the input embedding
-        z = x.clone().detach()  # Start from the input embedding
+        z = x.clone().detach()
         z_out, res = anderson(
             func, z,
             max_iter=self.max_iter,
@@ -285,6 +308,7 @@ class GETClassifier(nn.Module):
             threshold=self.max_iter
         )
 
+        # Apply final normalization and classification head
         if self.training:
             # For fixed point correction, return logits for all iterations
             return [self.head(self.norm(z_out[:, 0]))]
