@@ -9,6 +9,8 @@ import torchvision.transforms as transforms
 import argparse
 import numpy as np
 from tqdm import tqdm
+import time
+from datetime import datetime, timedelta
 from equilibrium_transformer_classifier import GETClassifier
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -132,13 +134,26 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ar
     if args.distributed:
         train_loader.sampler.set_epoch(epoch)
     
+    batch_times = []
+    data_times = []
+    forward_times = []
+    backward_times = []
+    
+    end = time.time()
     pbar = tqdm(train_loader, desc='Training', disable=not args.rank == 0)
     for batch_idx, (inputs, targets) in enumerate(pbar):
+        data_time = time.time() - end
+        data_times.append(data_time)
+        
         inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad()
         
-        # Forward pass
+        # Forward pass timing
+        forward_start = time.time()
         outputs = model(inputs)
+        torch.cuda.synchronize()
+        forward_time = time.time() - forward_start
+        forward_times.append(forward_time)
         
         # Handle multiple outputs during training (fixed point correction)
         if isinstance(outputs, list):
@@ -147,9 +162,13 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ar
         else:
             loss = criterion(outputs, targets)
         
-        # Backward pass
+        # Backward pass timing
+        backward_start = time.time()
         loss.backward()
         optimizer.step()
+        torch.cuda.synchronize()
+        backward_time = time.time() - backward_start
+        backward_times.append(backward_time)
         
         # Statistics
         total_loss += loss.item()
@@ -157,11 +176,18 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ar
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
         
+        # Batch time
+        batch_time = time.time() - end
+        batch_times.append(batch_time)
+        end = time.time()
+        
         # Update progress bar on main process
         if args.rank == 0:
             pbar.set_postfix({
                 'loss': total_loss / (batch_idx + 1),
-                'acc': 100. * correct / total
+                'acc': 100. * correct / total,
+                'batch_time': f'{np.mean(batch_times):.3f}s',
+                'data_time': f'{np.mean(data_times):.3f}s'
             })
     
     scheduler.step()
@@ -180,7 +206,14 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ar
         correct = correct.item()
         total = total.item()
     
-    return total_loss / len(train_loader), 100. * correct / total
+    timing_stats = {
+        'batch_time': np.mean(batch_times),
+        'data_time': np.mean(data_times),
+        'forward_time': np.mean(forward_times),
+        'backward_time': np.mean(backward_times)
+    }
+    
+    return total_loss / len(train_loader), 100. * correct / total, timing_stats
 
 def evaluate(model, test_loader, criterion, device, args):
     """Evaluate the model."""
@@ -298,24 +331,50 @@ def main():
     
     # Training loop
     best_acc = 0
+    total_train_time = 0
+    
+    if args.rank == 0:
+        print("\nStarting training...")
+        print(f"Total epochs: {args.epochs}")
+        print(f"Batches per epoch: {len(trainloader)}")
+        print(f"Batch size per GPU: {args.batch_size}")
+        print(f"Total batch size: {args.batch_size * (dist.get_world_size() if args.distributed else 1)}\n")
+    
     for epoch in range(args.epochs):
+        epoch_start = time.time()
+        
         if args.rank == 0:
             print(f'\nEpoch: {epoch+1}/{args.epochs}')
+            print(f'Started at: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
         
         # Train
-        train_loss, train_acc = train_epoch(model, trainloader, criterion, 
-                                          optimizer, scheduler, device, args)
+        train_loss, train_acc, timing_stats = train_epoch(model, trainloader, criterion, 
+                                                         optimizer, scheduler, device, args)
         
         # Evaluate
         test_loss, test_acc = evaluate(model, testloader, criterion, device, args)
         
+        # Timing information
+        epoch_time = time.time() - epoch_start
+        total_train_time += epoch_time
+        avg_epoch_time = total_train_time / (epoch + 1)
+        estimated_remaining = avg_epoch_time * (args.epochs - epoch - 1)
+        
         if args.rank == 0:
+            print(f'\nEpoch Statistics:')
             print(f'Train Loss: {train_loss:.3f} | Train Acc: {train_acc:.3f}%')
             print(f'Test Loss: {test_loss:.3f} | Test Acc: {test_acc:.3f}%')
+            print(f'\nTiming Information:')
+            print(f'Epoch time: {epoch_time:.2f}s')
+            print(f'Average batch time: {timing_stats["batch_time"]:.3f}s')
+            print(f'Average data time: {timing_stats["data_time"]:.3f}s')
+            print(f'Average forward time: {timing_stats["forward_time"]:.3f}s')
+            print(f'Average backward time: {timing_stats["backward_time"]:.3f}s')
+            print(f'Estimated time remaining: {str(timedelta(seconds=int(estimated_remaining)))}')
             
             # Save checkpoint
             if test_acc > best_acc:
-                print(f'Saving checkpoint... Best accuracy improved from {best_acc:.3f} to {test_acc:.3f}')
+                print(f'\nSaving checkpoint... Best accuracy improved from {best_acc:.3f} to {test_acc:.3f}')
                 state = {
                     'model': model.module.state_dict() if args.distributed else model.state_dict(),
                     'acc': test_acc,
@@ -324,6 +383,12 @@ def main():
                 }
                 torch.save(state, f'{args.output_dir}/best_classifier.pth')
                 best_acc = test_acc
+    
+    if args.rank == 0:
+        print("\nTraining completed!")
+        print(f"Total training time: {str(timedelta(seconds=int(total_train_time)))}")
+        print(f"Average epoch time: {str(timedelta(seconds=int(avg_epoch_time)))}")
+        print(f"Best test accuracy: {best_acc:.2f}%")
     
     # Cleanup
     cleanup_distributed()
