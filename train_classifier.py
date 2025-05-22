@@ -367,7 +367,11 @@ def main():
     ).to(device)
     
     if args.distributed:
-        model = DDP(model, device_ids=[args.local_rank])
+        # Enable finding unused parameters for DDP
+        model = DDP(model, 
+                   device_ids=[args.local_rank],
+                   find_unused_parameters=True,
+                   broadcast_buffers=False)
     
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
