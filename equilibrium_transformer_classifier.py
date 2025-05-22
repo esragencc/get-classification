@@ -141,14 +141,14 @@ class GETBlock(nn.Module):
         # First normalization and attention with residual
         x1 = self.norm1(x)
         attn_out = self.attn(x1)
-        x = x + self.gamma1.to(device) * attn_out
+        x = x + (self.gamma1.to(device) * attn_out)
         
         # Second normalization and MLP with residual
         x2 = self.norm2(x)
         mlp_out = self.mlp_forward(x2)
-        x = x + self.gamma2.to(device) * mlp_out
+        x = x + (self.gamma2.to(device) * mlp_out)
         
-        # Clip values for stability
+        # Clip values for stability (without in-place operation)
         x = torch.clamp(x, -10, 10)
         
         return x
@@ -201,7 +201,7 @@ def anderson(f, x0, max_iter=50, m=5, lam=1e-4, threshold=50, eps=1e-5):
     bsz = x0.shape[0]
     
     # Make sure input is contiguous and on the correct device
-    x0 = x0.contiguous()
+    x0 = x0.detach().clone().contiguous()
     device = x0.device
     dtype = x0.dtype
     
@@ -213,49 +213,67 @@ def anderson(f, x0, max_iter=50, m=5, lam=1e-4, threshold=50, eps=1e-5):
     F = torch.zeros(bsz, m, flat_size, dtype=dtype, device=device)
     
     # Initial steps with proper reshaping and device placement
-    X[:,0] = x0.reshape(bsz, -1)
-    F[:,0] = f(x0).contiguous().reshape(bsz, -1)
-    X[:,1] = F[:,0]
-    F[:,1] = f(F[:,0].reshape_as(x0)).contiguous().reshape(bsz, -1)
+    X_0 = x0.reshape(bsz, -1)
+    X = X.clone()
+    X[:,0] = X_0
+    
+    F_0 = f(x0).detach().clone().contiguous().reshape(bsz, -1)
+    F = F.clone()
+    F[:,0] = F_0
+    
+    X[:,1] = F[:,0].clone()
+    F[:,1] = f(F[:,0].reshape_as(x0)).detach().clone().contiguous().reshape(bsz, -1)
     
     H = torch.zeros(bsz, m+1, m+1, dtype=dtype, device=device)
-    H[:,0,1:] = H[:,1:,0] = 1
+    H = H.clone()
+    H[:,0,1:] = 1
+    H[:,1:,0] = 1
+    
     y = torch.zeros(bsz, m+1, 1, dtype=dtype, device=device)
+    y = y.clone()
     y[:,0] = 1
     
     res = []
-    for k in range(2, max_iter):
+    k = 2
+    while k < max_iter:
         n = min(k, m)
-        G = F[:,:n]-X[:,:n]
+        G = F[:,:n].clone() - X[:,:n].clone()
         
         # Add regularization for numerical stability
         reg_term = lam * torch.eye(n, dtype=dtype, device=device)[None]
-        H[:,1:n+1,1:n+1] = torch.bmm(G,G.transpose(1,2)) + reg_term
+        H_local = H[:,:n+1,:n+1].clone()
+        H_local[:,1:n+1,1:n+1] = torch.bmm(G, G.transpose(1,2)) + reg_term
         
         try:
             # Use more stable solver with better conditioning
-            alpha = torch.linalg.solve(H[:,:n+1,:n+1], y[:,:n+1])[:, 1:n+1, 0]
+            alpha = torch.linalg.solve(H_local, y[:,:n+1])[:, 1:n+1, 0]
             
             # Ensure alpha values are reasonable
             if torch.isnan(alpha).any() or torch.isinf(alpha).any():
                 raise RuntimeError("NaN or Inf in alpha values")
-                
+            
             # Update with computed coefficients
-            X[:,k%m] = (alpha[:,None] @ X[:,:n])[:,0]
+            X_new = torch.bmm(alpha.unsqueeze(1), X[:,:n].clone()).squeeze(1)
+            X = X.clone()
+            X[:,k%m] = X_new
             
         except RuntimeError as e:
             print(f"Warning: Solver failed at iteration {k}, falling back to simple iteration")
             print(f"Error: {str(e)}")
-            X[:,k%m] = F[:,k%m-1]
-            
+            X = X.clone()
+            X[:,k%m] = F[:,k%m-1].clone()
+        
         # Apply function and reshape
         try:
-            F[:,k%m] = f(X[:,k%m].reshape_as(x0)).contiguous().reshape(bsz, -1)
+            x_reshaped = X[:,k%m].clone().reshape_as(x0)
+            F_new = f(x_reshaped).detach().clone().contiguous().reshape(bsz, -1)
+            F = F.clone()
+            F[:,k%m] = F_new
         except RuntimeError as e:
             print(f"Warning: Function application failed at iteration {k}")
             print(f"Error: {str(e)}")
             break
-            
+        
         # Compute relative error with better numerical stability
         diff_norm = torch.norm(F[:,k%m] - X[:,k%m], dim=1)
         denom = torch.norm(F[:,k%m], dim=1)
@@ -266,7 +284,13 @@ def anderson(f, x0, max_iter=50, m=5, lam=1e-4, threshold=50, eps=1e-5):
         if res[-1] < eps or k >= threshold:
             break
             
-    return X[:,k%m].reshape_as(x0), res
+        k += 1
+    
+    result = X[:,k%m].clone().reshape_as(x0)
+    if result.requires_grad:
+        result.retain_grad()
+    
+    return result, res
 
 class GETClassifier(nn.Module):
     """
