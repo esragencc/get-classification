@@ -119,10 +119,14 @@ def setup_distributed(args):
     print(f"[Rank {args.rank}] master_port: {os.environ.get('MASTER_PORT', 'Not set')}")
 
     args.distributed = True
+    
+    # Set the device before initializing process group
     torch.cuda.set_device(args.local_rank)
+    args.device = torch.device(f'cuda:{args.local_rank}')
+    
     args.dist_backend = 'nccl'
     
-    # Initialize process group with a timeout
+    # Initialize process group with a timeout and device_id
     max_retries = 3
     retry_count = 0
     while retry_count < max_retries:
@@ -143,7 +147,8 @@ def setup_distributed(args):
                 raise
             time.sleep(10)  # Wait before retrying
     
-    dist.barrier()  # Synchronize all processes
+    # Add barrier with device_ids
+    dist.barrier(device_ids=[args.local_rank])  # Synchronize with proper device mapping
 
 def cleanup_distributed():
     """Cleanup distributed training resources."""

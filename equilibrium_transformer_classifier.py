@@ -127,40 +127,59 @@ def anderson(f, x0, max_iter=50, m=5, lam=1e-4, threshold=50, eps=1e-5):
     """ Anderson acceleration for fixed point iteration. """
     bsz = x0.shape[0]
     
-    # Make sure input is contiguous
+    # Make sure input is contiguous and on the correct device
     x0 = x0.contiguous()
+    device = x0.device
+    dtype = x0.dtype
     
     # Calculate flattened size
     flat_size = x0.numel() // bsz
     
-    X = torch.zeros(bsz, m, flat_size, dtype=x0.dtype, device=x0.device)
-    F = torch.zeros(bsz, m, flat_size, dtype=x0.dtype, device=x0.device)
+    X = torch.zeros(bsz, m, flat_size, dtype=dtype, device=device)
+    F = torch.zeros(bsz, m, flat_size, dtype=dtype, device=device)
     
-    # Initial steps with proper reshaping
+    # Initial steps with proper reshaping and device placement
     X[:,0] = x0.reshape(bsz, -1)
     F[:,0] = f(x0).contiguous().reshape(bsz, -1)
     X[:,1] = F[:,0]
     F[:,1] = f(F[:,0].reshape_as(x0)).contiguous().reshape(bsz, -1)
     
-    H = torch.zeros(bsz, m+1, m+1, dtype=x0.dtype, device=x0.device)
+    H = torch.zeros(bsz, m+1, m+1, dtype=dtype, device=device)
     H[:,0,1:] = H[:,1:,0] = 1
-    y = torch.zeros(bsz, m+1, 1, dtype=x0.dtype, device=x0.device)
+    y = torch.zeros(bsz, m+1, 1, dtype=dtype, device=device)
     y[:,0] = 1
     
     res = []
     for k in range(2, max_iter):
         n = min(k, m)
         G = F[:,:n]-X[:,:n]
-        H[:,1:n+1,1:n+1] = torch.bmm(G,G.transpose(1,2)) + lam*torch.eye(n, dtype=x0.dtype,device=x0.device)[None]
         
-        # Use torch.linalg.solve instead of torch.solve
-        alpha = torch.linalg.solve(H[:,:n+1,:n+1], y[:,:n+1])[:, 1:n+1, 0]   # (bsz x n)
+        # Add regularization for numerical stability
+        reg_term = lam * torch.eye(n, dtype=dtype, device=device)[None]
+        H[:,1:n+1,1:n+1] = torch.bmm(G,G.transpose(1,2)) + reg_term
         
+        try:
+            # Use more stable solver with better conditioning
+            alpha = torch.linalg.solve(H[:,:n+1,:n+1], y[:,:n+1])[:, 1:n+1, 0]
+        except RuntimeError:
+            # If solver fails, fall back to simple iteration
+            print(f"Warning: Solver failed at iteration {k}, falling back to simple iteration")
+            X[:,k%m] = F[:,k%m-1]
+            F[:,k%m] = f(X[:,k%m].reshape_as(x0)).contiguous().reshape(bsz, -1)
+            continue
+            
+        # Update with computed coefficients
         X[:,k%m] = (alpha[:,None] @ X[:,:n])[:,0]
         F[:,k%m] = f(X[:,k%m].reshape_as(x0)).contiguous().reshape(bsz, -1)
-        res.append((F[:,k%m] - X[:,k%m]).norm().item()/(1e-5 + F[:,k%m].norm().item()))
+        
+        # Compute relative error
+        res_k = (F[:,k%m] - X[:,k%m]).norm().item()
+        denom = F[:,k%m].norm().item()
+        res.append(res_k / (eps + denom))  # Avoid division by zero
+        
         if (res[-1] < eps) or (k >= threshold):
             break
+            
     return X[:,k%m].reshape_as(x0), res
 
 class GETClassifier(nn.Module):
