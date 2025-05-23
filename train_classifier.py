@@ -120,19 +120,43 @@ def setup_distributed(args):
 
     args.distributed = True
     
-    # Set NCCL parameters for better stability
-    os.environ['NCCL_DEBUG'] = 'INFO'
-    os.environ['NCCL_SOCKET_IFNAME'] = 'eth0'  # Adjust if needed
-    os.environ['NCCL_IB_DISABLE'] = '1'  # Disable InfiniBand if causing issues
-    os.environ['NCCL_BLOCKING_WAIT'] = '1'
-    os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
-    os.environ['NCCL_TIMEOUT'] = '120000'  # Increase timeout to 120 seconds
-    
     # Set the device before initializing process group
     torch.cuda.set_device(args.local_rank)
     args.device = torch.device(f'cuda:{args.local_rank}')
     
-    args.dist_backend = 'nccl'
+    # Set PyTorch/NCCL environment variables for better stability
+    os.environ['TORCH_NCCL_BLOCKING_WAIT'] = '1'
+    os.environ['TORCH_NCCL_ASYNC_ERROR_HANDLING'] = '1'
+    os.environ['NCCL_DEBUG'] = 'INFO'
+    os.environ['NCCL_SOCKET_NTHREADS'] = '4'
+    os.environ['NCCL_NSOCKS_PERTHREAD'] = '4'
+    os.environ['NCCL_MIN_NCHANNELS'] = '4'
+    
+    # Try to automatically detect the network interface
+    try:
+        import socket
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        interface_name = None
+        
+        import netifaces
+        for iface in netifaces.interfaces():
+            try:
+                if netifaces.ifaddresses(iface)[netifaces.AF_INET][0]['addr'] == ip:
+                    interface_name = iface
+                    break
+            except (KeyError, IndexError):
+                continue
+        
+        if interface_name:
+            print(f"[Rank {args.rank}] Detected network interface: {interface_name}")
+            os.environ['NCCL_SOCKET_IFNAME'] = interface_name
+        else:
+            print(f"[Rank {args.rank}] Warning: Could not detect network interface automatically")
+    except ImportError:
+        print(f"[Rank {args.rank}] Warning: netifaces package not found, skipping automatic interface detection")
+    except Exception as e:
+        print(f"[Rank {args.rank}] Warning: Error detecting network interface: {str(e)}")
     
     # Initialize process group with a timeout and device_id
     max_retries = 3
@@ -140,13 +164,30 @@ def setup_distributed(args):
     while retry_count < max_retries:
         try:
             print(f"[Rank {args.rank}] Attempting to initialize process group (attempt {retry_count + 1}/{max_retries})")
-            dist.init_process_group(
-                backend=args.dist_backend,
-                init_method='env://',
-                timeout=timedelta(minutes=2)  # Increase timeout to 2 minutes
-            )
+            
+            # Set initialization parameters
+            init_params = {
+                'backend': args.dist_backend,
+                'init_method': 'env://',
+                'timeout': timedelta(minutes=2),
+                'world_size': args.world_size,
+                'rank': args.rank,
+            }
+            
+            dist.init_process_group(**init_params)
+            
+            # Initialize process group
             print(f"[Rank {args.rank}] Successfully initialized process group")
+            
+            # Verify the process group is working
+            if dist.is_initialized():
+                print(f"[Rank {args.rank}] Process group verification successful")
+                # Try a simple all_reduce to verify communication
+                test_tensor = torch.tensor([args.rank], device=args.device)
+                dist.all_reduce(test_tensor)
+                print(f"[Rank {args.rank}] Initial all_reduce test successful")
             break
+            
         except Exception as e:
             retry_count += 1
             print(f"[Rank {args.rank}] Failed to initialize process group (attempt {retry_count}/{max_retries})")
@@ -160,11 +201,20 @@ def setup_distributed(args):
         dist.barrier(device_ids=[args.local_rank], timeout=timedelta(seconds=60))
     except Exception as e:
         print(f"[Rank {args.rank}] Warning: Initial barrier synchronization failed: {str(e)}")
+        print(f"[Rank {args.rank}] Attempting to continue anyway...")
 
 def cleanup_distributed():
     """Cleanup distributed training resources."""
     if dist.is_initialized():
-        dist.destroy_process_group()
+        try:
+            # Try to synchronize before destroying
+            dist.barrier()
+            dist.destroy_process_group()
+            print("Successfully cleaned up distributed training resources")
+        except Exception as e:
+            print(f"Warning: Error during distributed cleanup: {str(e)}")
+            # Force cleanup even if synchronization fails
+            dist.destroy_process_group()
 
 def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, args, epoch):
     """Train for one epoch."""
