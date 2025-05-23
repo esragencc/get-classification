@@ -120,6 +120,14 @@ def setup_distributed(args):
 
     args.distributed = True
     
+    # Set NCCL parameters for better stability
+    os.environ['NCCL_DEBUG'] = 'INFO'
+    os.environ['NCCL_SOCKET_IFNAME'] = 'eth0'  # Adjust if needed
+    os.environ['NCCL_IB_DISABLE'] = '1'  # Disable InfiniBand if causing issues
+    os.environ['NCCL_BLOCKING_WAIT'] = '1'
+    os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'
+    os.environ['NCCL_TIMEOUT'] = '120000'  # Increase timeout to 120 seconds
+    
     # Set the device before initializing process group
     torch.cuda.set_device(args.local_rank)
     args.device = torch.device(f'cuda:{args.local_rank}')
@@ -135,7 +143,7 @@ def setup_distributed(args):
             dist.init_process_group(
                 backend=args.dist_backend,
                 init_method='env://',
-                timeout=timedelta(minutes=1)
+                timeout=timedelta(minutes=2)  # Increase timeout to 2 minutes
             )
             print(f"[Rank {args.rank}] Successfully initialized process group")
             break
@@ -147,8 +155,11 @@ def setup_distributed(args):
                 raise
             time.sleep(10)  # Wait before retrying
     
-    # Add barrier with device_ids
-    dist.barrier(device_ids=[args.local_rank])  # Synchronize with proper device mapping
+    # Add barrier with device_ids and timeout
+    try:
+        dist.barrier(device_ids=[args.local_rank], timeout=timedelta(seconds=60))
+    except Exception as e:
+        print(f"[Rank {args.rank}] Warning: Initial barrier synchronization failed: {str(e)}")
 
 def cleanup_distributed():
     """Cleanup distributed training resources."""
@@ -171,93 +182,105 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ar
     backward_times = []
     
     end = time.time()
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}', disable=not args.rank == 0)
     
-    # Create progress bar with better formatting
-    if args.rank == 0:
-        pbar = tqdm(
-            train_loader,
-            desc=f'Epoch {epoch+1}/{args.epochs}',
-            bar_format='{l_bar}{bar:20}{r_bar}',
-            dynamic_ncols=True
-        )
-    else:
-        pbar = train_loader
-        
+    # Add synchronization points
+    sync_period = 10  # Synchronize every 10 batches
+    
     for batch_idx, (inputs, targets) in enumerate(pbar):
+        # Periodic synchronization
+        if args.distributed and batch_idx % sync_period == 0:
+            try:
+                dist.barrier(device_ids=[args.local_rank], timeout=timedelta(seconds=30))
+            except Exception as e:
+                print(f"[Rank {args.rank}] Warning: Periodic sync failed at batch {batch_idx}: {str(e)}")
+        
         data_time = time.time() - end
         data_times.append(data_time)
         
-        inputs, targets = inputs.to(device), targets.to(device)
-        optimizer.zero_grad()
-        
-        # Forward pass timing
-        forward_start = time.time()
-        outputs = model(inputs)
-        torch.cuda.synchronize()
-        forward_time = time.time() - forward_start
-        forward_times.append(forward_time)
-        
-        # Handle multiple outputs during training (fixed point correction)
-        if isinstance(outputs, list):
-            loss = sum(criterion(output, targets) for output in outputs) / len(outputs)
-            outputs = outputs[-1]  # Use last output for accuracy calculation
-        else:
-            loss = criterion(outputs, targets)
-        
-        # Backward pass timing
-        backward_start = time.time()
-        loss.backward()
-        optimizer.step()
-        torch.cuda.synchronize()
-        backward_time = time.time() - backward_start
-        backward_times.append(backward_time)
-        
-        # Statistics
-        total_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
+        try:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            
+            # Forward pass timing
+            forward_start = time.time()
+            outputs = model(inputs)
+            torch.cuda.synchronize()
+            forward_time = time.time() - forward_start
+            forward_times.append(forward_time)
+            
+            # Handle multiple outputs during training (fixed point correction)
+            if isinstance(outputs, list):
+                loss = sum(criterion(output, targets) for output in outputs) / len(outputs)
+                outputs = outputs[-1]  # Use last output for accuracy calculation
+            else:
+                loss = criterion(outputs, targets)
+            
+            # Backward pass timing
+            backward_start = time.time()
+            loss.backward()
+            optimizer.step()
+            torch.cuda.synchronize()
+            backward_time = time.time() - backward_start
+            backward_times.append(backward_time)
+            
+            # Statistics
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+            
+        except RuntimeError as e:
+            print(f"[Rank {args.rank}] Error in training batch {batch_idx}: {str(e)}")
+            if "NCCL" in str(e) or "timeout" in str(e).lower():
+                print(f"[Rank {args.rank}] Attempting to recover from NCCL error...")
+                try:
+                    dist.barrier(device_ids=[args.local_rank], timeout=timedelta(seconds=30))
+                except:
+                    pass
+                continue
+            else:
+                raise e
         
         # Batch time
         batch_time = time.time() - end
         batch_times.append(batch_time)
         end = time.time()
         
-        # Update progress bar on main process with better formatting
-        if args.rank == 0 and isinstance(pbar, tqdm):
-            avg_loss = total_loss / (batch_idx + 1)
-            avg_acc = 100. * correct / total
-            avg_batch_time = np.mean(batch_times[-100:]) if batch_times else 0  # Last 100 batches
-            avg_data_time = np.mean(data_times[-100:]) if data_times else 0
-            
-            # Format metrics for better readability
-            metrics = {
-                'Loss': f'{avg_loss:.4f}',
-                'Acc': f'{avg_acc:.2f}%',
-                'Time': f'{avg_batch_time:.3f}s',
-                'Data': f'{avg_data_time:.3f}s',
-                'LR': f'{scheduler.get_last_lr()[0]:.6f}'
-            }
-            
-            # Create a clean metrics string
-            metrics_str = ' | '.join(f'{k}: {v}' for k, v in metrics.items())
-            pbar.set_postfix_str(metrics_str)
+        # Update progress bar on main process
+        if args.rank == 0:
+            pbar.set_postfix({
+                'loss': total_loss / (batch_idx + 1),
+                'acc': 100. * correct / total,
+                'batch_time': f'{np.mean(batch_times):.3f}s',
+                'data_time': f'{np.mean(data_times):.3f}s'
+            })
     
     scheduler.step()
     
-    # Synchronize metrics across processes
+    # Final synchronization with longer timeout
     if args.distributed:
-        total_loss = torch.tensor(total_loss).cuda()
-        correct = torch.tensor(correct).cuda()
-        total = torch.tensor(total).cuda()
-        
-        dist.all_reduce(total_loss)
-        dist.all_reduce(correct)
-        dist.all_reduce(total)
-        
-        total_loss = total_loss.item() / dist.get_world_size()
-        correct = correct.item()
-        total = total.item()
+        try:
+            dist.barrier(device_ids=[args.local_rank], timeout=timedelta(seconds=60))
+        except Exception as e:
+            print(f"[Rank {args.rank}] Warning: Final epoch sync failed: {str(e)}")
+    
+    # Synchronize metrics across processes with timeout handling
+    if args.distributed:
+        try:
+            # Convert to tensors on GPU
+            metrics = torch.tensor([total_loss, correct, total], dtype=torch.float32, device=device)
+            
+            # All-reduce with timeout
+            dist.all_reduce(metrics, timeout=timedelta(seconds=30))
+            
+            total_loss, correct, total = metrics.tolist()
+            total_loss = total_loss / dist.get_world_size()
+            
+        except Exception as e:
+            print(f"[Rank {args.rank}] Warning: Metric synchronization failed: {str(e)}")
+            # Use local metrics if synchronization fails
+            pass
     
     timing_stats = {
         'batch_time': np.mean(batch_times),
