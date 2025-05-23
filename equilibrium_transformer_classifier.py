@@ -197,7 +197,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 def anderson(f, x0, max_iter=50, m=5, lam=1e-4, threshold=50, eps=1e-5):
-    """ Anderson acceleration for fixed point iteration. """
+    """ Anderson acceleration for fixed point iteration with improved numerical stability. """
     bsz = x0.shape[0]
     
     # Make sure input is contiguous and on the correct device
@@ -235,33 +235,59 @@ def anderson(f, x0, max_iter=50, m=5, lam=1e-4, threshold=50, eps=1e-5):
     
     res = []
     k = 2
+    
+    # Adaptive regularization
+    min_reg = lam
+    max_reg = 1e-1
+    reg_factor = 10.0
+    current_reg = min_reg
+    
     while k < max_iter:
         n = min(k, m)
         G = F[:,:n].clone() - X[:,:n].clone()
         
-        # Add regularization for numerical stability
-        reg_term = lam * torch.eye(n, dtype=dtype, device=device)[None]
+        # Compute condition number for monitoring
+        G_norm = torch.norm(G, dim=2)
+        cond_approx = torch.max(G_norm, dim=1)[0] / (torch.min(G_norm, dim=1)[0] + 1e-10)
+        
+        # Add adaptive regularization for numerical stability
+        reg_term = current_reg * torch.eye(n, dtype=dtype, device=device)[None]
         H_local = H[:,:n+1,:n+1].clone()
         H_local[:,1:n+1,1:n+1] = torch.bmm(G, G.transpose(1,2)) + reg_term
         
         try:
-            # Use more stable solver with better conditioning
+            # Try solving with current regularization
             alpha = torch.linalg.solve(H_local, y[:,:n+1])[:, 1:n+1, 0]
             
-            # Ensure alpha values are reasonable
+            # Check for NaN/Inf values
             if torch.isnan(alpha).any() or torch.isinf(alpha).any():
                 raise RuntimeError("NaN or Inf in alpha values")
+            
+            # Normalize alpha values for stability
+            alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-10)
             
             # Update with computed coefficients
             X_new = torch.bmm(alpha.unsqueeze(1), X[:,:n].clone()).squeeze(1)
             X = X.clone()
             X[:,k%m] = X_new
             
+            # If successful, gradually decrease regularization
+            current_reg = max(min_reg, current_reg / 1.2)
+            
         except RuntimeError as e:
-            print(f"Warning: Solver failed at iteration {k}, falling back to simple iteration")
-            print(f"Error: {str(e)}")
-            X = X.clone()
-            X[:,k%m] = F[:,k%m-1].clone()
+            if "singular" in str(e).lower() or "nan" in str(e).lower() or "inf" in str(e).lower():
+                # Increase regularization and try again
+                current_reg = min(max_reg, current_reg * reg_factor)
+                print(f"Warning: Solver failed at iteration {k}, increasing regularization to {current_reg:.1e}")
+                
+                # Fall back to simple iteration if regularization is too high
+                if current_reg >= max_reg:
+                    print(f"Warning: Maximum regularization reached, falling back to simple iteration")
+                    X = X.clone()
+                    X[:,k%m] = F[:,k%m-1].clone()
+                continue
+            else:
+                raise e
         
         # Apply function and reshape
         try:
@@ -398,7 +424,7 @@ class GETClassifier(nn.Module):
             return z
         
         # Initialize z with the input embedding
-        z = x.clone().detach()
+        z = x.clone()
         z_out, res = anderson(
             func, z,
             max_iter=self.max_iter,
@@ -409,8 +435,17 @@ class GETClassifier(nn.Module):
 
         # Apply final normalization and classification head
         if self.training:
-            # For fixed point correction, return logits for all iterations
-            return [self.head(self.norm(z_out[:, 0]))]
+            # For training, compute logits for all patches and average
+            z_norm = self.norm(z_out)
+            logits = self.head(z_norm)
+            # Average over patches (if needed)
+            if len(logits.shape) > 2:  # If we have patch dimension
+                logits = logits.mean(dim=1)  # Average over patches
+            return [logits]  # Return as list for consistency
         else:
-            # For inference, return logits from final iteration
-            return self.head(self.norm(z_out[:, 0])) 
+            # For inference, use the first token (CLS token equivalent)
+            z_norm = self.norm(z_out)
+            logits = self.head(z_norm)
+            if len(logits.shape) > 2:  # If we have patch dimension
+                logits = logits.mean(dim=1)  # Average over patches
+            return logits 
