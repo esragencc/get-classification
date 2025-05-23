@@ -241,7 +241,8 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ar
         # Periodic synchronization
         if args.distributed and batch_idx % sync_period == 0:
             try:
-                dist.barrier(device_ids=[args.local_rank], timeout=timedelta(seconds=30))
+                # Simple barrier without timeout
+                dist.barrier(device_ids=[args.local_rank])
             except Exception as e:
                 print(f"[Rank {args.rank}] Warning: Periodic sync failed at batch {batch_idx}: {str(e)}")
         
@@ -282,10 +283,10 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ar
             
         except RuntimeError as e:
             print(f"[Rank {args.rank}] Error in training batch {batch_idx}: {str(e)}")
-            if "NCCL" in str(e) or "timeout" in str(e).lower():
+            if "NCCL" in str(e):
                 print(f"[Rank {args.rank}] Attempting to recover from NCCL error...")
                 try:
-                    dist.barrier(device_ids=[args.local_rank], timeout=timedelta(seconds=30))
+                    dist.barrier(device_ids=[args.local_rank])
                 except:
                     pass
                 continue
@@ -308,21 +309,21 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ar
     
     scheduler.step()
     
-    # Final synchronization with longer timeout
+    # Final synchronization
     if args.distributed:
         try:
-            dist.barrier(device_ids=[args.local_rank], timeout=timedelta(seconds=60))
+            dist.barrier(device_ids=[args.local_rank])
         except Exception as e:
             print(f"[Rank {args.rank}] Warning: Final epoch sync failed: {str(e)}")
     
-    # Synchronize metrics across processes with timeout handling
+    # Synchronize metrics across processes
     if args.distributed:
         try:
             # Convert to tensors on GPU
             metrics = torch.tensor([total_loss, correct, total], dtype=torch.float32, device=device)
             
-            # All-reduce with timeout
-            dist.all_reduce(metrics, timeout=timedelta(seconds=30))
+            # All-reduce without timeout
+            dist.all_reduce(metrics)
             
             total_loss, correct, total = metrics.tolist()
             total_loss = total_loss / dist.get_world_size()
