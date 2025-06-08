@@ -43,7 +43,7 @@ torchrun \
     --global_batch_size 256 \
     --eval_batch_size 256 \
     --global_seed 42 \
-    --num_workers 4 \
+    --num_workers 2 \
     --mem \
     --log_every 100 \
     --ckpt_every 5000 \
