@@ -52,9 +52,12 @@ def forward_no_deq(self, x):
 
 import types
 model.forward = types.MethodType(forward_no_deq, model)
+model = model.to(device)  # Ensure all submodules are on the correct device after patching
 
-# Ensure all parameters and buffers are on the correct device (including submodules)
-model = model.to(device)
+# Debug: print device of each block's parameters
+for i, block in enumerate(model.deq_blocks):
+    for name, param in block.named_parameters():
+        print(f"Block {i} param {name} device: {param.device}")
 
 # Optimizer and loss
 optimizer = optim.AdamW(model.parameters(), lr=LR)
