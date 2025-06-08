@@ -19,6 +19,7 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 import logging
+import math
 
 from models.get import GET_Classifier_models
 
@@ -121,7 +122,7 @@ def main(args):
         else:
             # Cosine annealing after warmup
             progress = (step - warmup_steps) / (total_steps - warmup_steps)
-            return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)))
+            return 0.5 * (1 + math.cos(progress * math.pi))
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
@@ -130,16 +131,16 @@ def main(args):
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
     ])
 
     transform_test = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
     ])
 
     # Training dataset
-    train_dataset = torchvision.datasets.CIFAR10(
+    train_dataset = torchvision.datasets.CIFAR100(
         root=args.data_path, train=True, download=True, transform=transform_train
     )
     train_sampler = DistributedSampler(
@@ -160,7 +161,7 @@ def main(args):
     )
 
     # Test dataset
-    test_dataset = torchvision.datasets.CIFAR10(
+    test_dataset = torchvision.datasets.CIFAR100(
         root=args.data_path, train=False, download=True, transform=transform_test
     )
     test_sampler = DistributedSampler(
@@ -393,7 +394,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--model', type=str, choices=list(GET_Classifier_models.keys()), default='GET-Classifier-S')
     parser.add_argument('--input_size', type=int, default=32)
-    parser.add_argument('--num_classes', type=int, default=10)
+    parser.add_argument('--num_classes', type=int, default=100)
     
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
