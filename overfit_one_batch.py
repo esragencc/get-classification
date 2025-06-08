@@ -53,6 +53,13 @@ def forward_no_deq(self, x):
 import types
 model.forward = types.MethodType(forward_no_deq, model)
 
+# Ensure all parameters and buffers are on the correct device (including submodules)
+model = model.to(device)
+for name, param in model.named_parameters():
+    param.data = param.data.to(device)
+for name, buf in model.named_buffers():
+    buf.data = buf.data.to(device)
+
 # Optimizer and loss
 optimizer = optim.AdamW(model.parameters(), lr=LR)
 criterion = nn.CrossEntropyLoss()
