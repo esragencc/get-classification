@@ -113,8 +113,17 @@ def main(args):
     # Setup optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
-    # Setup learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    # Setup learning rate scheduler with warmup
+    warmup_steps = 500
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            # Cosine annealing after warmup
+            progress = (step - warmup_steps) / (total_steps - warmup_steps)
+            return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)))
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
     # Setup data
     transform_train = transforms.Compose([
@@ -248,6 +257,7 @@ def main(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             
             opt.step()
+            scheduler.step()  # Step scheduler every iteration
 
             # Update running statistics
             if isinstance(output, list):
@@ -306,9 +316,6 @@ def main(args):
                                f'Test Acc@1: {test_acc1:.2f}%, Test Acc@5: {test_acc5:.2f}%')
                 model.train()  # Switch back to training mode
                 dist.barrier()
-
-        # Step scheduler
-        scheduler.step()
 
     # Final evaluation
     test_acc1, test_acc5, test_loss = evaluate(model, test_loader, criterion, device, world_size)

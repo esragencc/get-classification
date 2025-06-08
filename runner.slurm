@@ -33,10 +33,10 @@ torchrun \
     --data_path ./data \
     --name cifar10_get_classifier \
     --results_dir results_classifier \
-    --model GET-Classifier-S \
+    --model GET-Classifier-T \
     --input_size 32 \
     --num_classes 10 \
-    --lr 5e-4 \
+    --lr 2e-3 \
     --weight_decay 1e-4 \
     --grad_clip 0.5 \
     --epochs 200 \
@@ -50,8 +50,8 @@ torchrun \
     --eval_every 1000 \
     --f_solver simple_fixed_point_iter \
     --b_solver simple_fixed_point_iter \
-    --f_max_iter 5 \
-    --b_max_iter 5 \
+    --f_max_iter 10 \
+    --b_max_iter 10 \
     --f_tol 1e-3 \
     --b_tol 1e-3
 
