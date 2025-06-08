@@ -107,7 +107,7 @@ def main(args):
     )
     
     # Setup DDP
-    model = DDP(model.to(device), device_ids=[rank], find_unused_parameters=True)
+    model = DDP(model.to(device), device_ids=[rank], find_unused_parameters=False)
     logger.info(f'Model Parameters: {sum(p.numel() for p in model.parameters()):,}')
 
     # Setup optimizer
