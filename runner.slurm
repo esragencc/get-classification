@@ -48,11 +48,11 @@ torchrun \
     --log_every 100 \
     --ckpt_every 5000 \
     --eval_every 1000 \
-    --f_solver broyden \
-    --b_solver broyden \
-    --f_max_iter 15 \
-    --b_max_iter 15 \
-    --f_tol 1e-4 \
-    --b_tol 1e-4
+    --f_solver simple_fixed_point \
+    --b_solver simple_fixed_point \
+    --f_max_iter 5 \
+    --b_max_iter 5 \
+    --f_tol 1e-3 \
+    --b_tol 1e-3
 
 echo "Training completed at $(date)" 

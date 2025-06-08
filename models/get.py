@@ -414,8 +414,9 @@ class GET_Classifier(nn.Module):
                     z = block(z, None, None)
             return z
         
-        # DEQ forward pass
-        z_out, info = self.deq(func, x)
+        # DEQ forward pass with stable initialization
+        z_init = torch.zeros_like(x)  # Start from zeros instead of input
+        z_out, info = self.deq(func, z_init)
         
         if self.training:
             # Return logits for all iterations during training

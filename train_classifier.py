@@ -210,11 +210,24 @@ def main(args):
             
             # Handle DEQ output (list during training)
             if isinstance(output, list):
+                # Check for NaN in DEQ outputs
+                for i, out in enumerate(output):
+                    if torch.isnan(out).any():
+                        logger.error(f"NaN detected in DEQ iteration {i} at step {train_steps}!")
+                        logger.error(f"Input stats: min={data.min():.4f}, max={data.max():.4f}, mean={data.mean():.4f}")
+                        raise ValueError("DEQ output contains NaN")
+                
                 # Use fp_correction for DEQ training
                 loss, loss_list = fp_correction(criterion, (output, target), return_loss_values=True)
                 # Use final output for accuracy computation
                 final_output = output[-1]
             else:
+                # Check for NaN in regular output
+                if torch.isnan(output).any():
+                    logger.error(f"NaN detected in model output at step {train_steps}!")
+                    logger.error(f"Input stats: min={data.min():.4f}, max={data.max():.4f}, mean={data.mean():.4f}")
+                    raise ValueError("Model output contains NaN")
+                
                 loss = criterion(output, target)
                 final_output = output
             
