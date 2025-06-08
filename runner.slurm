@@ -48,8 +48,8 @@ torchrun \
     --log_every 100 \
     --ckpt_every 5000 \
     --eval_every 1000 \
-    --f_solver simple_fixed_point \
-    --b_solver simple_fixed_point \
+    --f_solver simple_fixed_point_iter \
+    --b_solver simple_fixed_point_iter \
     --f_max_iter 5 \
     --b_max_iter 5 \
     --f_tol 1e-3 \
