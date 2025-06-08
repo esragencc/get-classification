@@ -351,8 +351,10 @@ class GET_Classifier(nn.Module):
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         
         num_patches = self.x_embedder.num_patches
-        # Fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        # Add a learnable [CLS] token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        # Fixed sin-cos embedding, with extra token for [CLS]:
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + num_patches, hidden_size), requires_grad=False)
 
         # Only DEQ blocks (no injection transformer)
         self.deq_blocks = nn.ModuleList([
@@ -382,8 +384,8 @@ class GET_Classifier(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-        # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        # Initialize (and freeze) pos_embed by sin-cos embedding, with extra token for [CLS]:
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5), cls_token=True, extra_tokens=1)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch embedding:
@@ -395,6 +397,9 @@ class GET_Classifier(nn.Module):
         nn.init.normal_(self.head.weight, std=0.02)
         nn.init.constant_(self.head.bias, 0)
 
+        # Initialize [CLS] token
+        nn.init.normal_(self.cls_token, std=0.02)
+
     def forward(self, x):
         """
         Forward pass for classification.
@@ -404,7 +409,12 @@ class GET_Classifier(nn.Module):
         reset_norm(self)
 
         # Patch embedding + positional encoding
-        x = self.x_embedder(x) + self.pos_embed     # (B, N, D)
+        x = self.x_embedder(x)  # (B, N, D)
+        B = x.shape[0]
+        # Expand and prepend [CLS] token
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
+        x = torch.cat((cls_tokens, x), dim=1)  # (B, 1+N, D)
+        x = x + self.pos_embed  # (B, 1+N, D)
         
         def func(z):
             for block in self.deq_blocks:
@@ -420,13 +430,13 @@ class GET_Classifier(nn.Module):
         
         if self.training:
             # Return logits for all iterations during training for fp_correction
-            return [self.head(self.norm_final(z_iter.mean(dim=1))) for z_iter in z_out]
+            return [self.head(self.norm_final(z_iter[:, 0])) for z_iter in z_out]  # Use [CLS] token
         else:
-            # Classification head on mean pooled output
-            z_final = z_out[-1]                          # (B, N, D)
+            # Classification head on [CLS] token output
+            z_final = z_out[-1]                          # (B, 1+N, D)
             z_final = self.norm_final(z_final)
-            pooled = z_final.mean(dim=1)                # Mean pooling over tokens
-            logits = self.head(pooled)                  # (B, num_classes)
+            cls_token_final = z_final[:, 0]              # (B, D)
+            logits = self.head(cls_token_final)          # (B, num_classes)
             return logits
 
 
