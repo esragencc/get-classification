@@ -31,6 +31,25 @@ args = DummyArgs()
 model = GET_Classifier_models[MODEL_NAME](args=args, input_size=INPUT_SIZE, num_classes=NUM_CLASSES).to(device)
 model.train()
 
+# --- Disable DEQ: Replace model's forward with a standard transformer stack ---
+def forward_no_deq(self, x):
+    # Patch embedding + positional encoding
+    x = self.x_embedder(x)
+    B = x.shape[0]
+    cls_tokens = self.cls_token.expand(B, -1, -1)
+    x = torch.cat((cls_tokens, x), dim=1)
+    x = x + self.pos_embed
+    # Just run through the blocks sequentially
+    for block in self.deq_blocks:
+        x = block(x, None, None)
+    x = self.norm_final(x)
+    cls_token_final = x[:, 0]
+    logits = self.head(cls_token_final)
+    return logits
+
+import types
+model.forward = types.MethodType(forward_no_deq, model)
+
 # Optimizer and loss
 optimizer = optim.AdamW(model.parameters(), lr=LR)
 criterion = nn.CrossEntropyLoss()
