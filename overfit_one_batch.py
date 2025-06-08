@@ -30,42 +30,6 @@ class DummyArgs:
 args = DummyArgs()
 model = GET_Classifier_models[MODEL_NAME](args=args, input_size=INPUT_SIZE, num_classes=NUM_CLASSES).to(device)
 model.train()
-# Ensure all parameters and buffers are on the correct device
-model.cls_token = nn.Parameter(model.cls_token.data.to(device))
-model.pos_embed = nn.Parameter(model.pos_embed.data.to(device))
-
-# --- Disable DEQ: Replace model's forward with a standard transformer stack ---
-def forward_no_deq(self, x):
-    # Patch embedding + positional encoding
-    x = self.x_embedder(x)
-    B = x.shape[0]
-    cls_tokens = self.cls_token.expand(B, -1, -1)
-    x = torch.cat((cls_tokens, x), dim=1)
-    x = x + self.pos_embed
-    # Just run through the blocks sequentially
-    for block in self.deq_blocks:
-        x = block(x, None, None)
-    x = self.norm_final(x)
-    cls_token_final = x[:, 0]
-    logits = self.head(cls_token_final)
-    return logits
-
-import types
-model.forward = types.MethodType(forward_no_deq, model)
-model = model.to(device)  # Ensure all submodules are on the correct device after patching
-
-# Debug: print device of all parameters and buffers
-print('--- All model parameters and buffers device check ---')
-for name, param in model.named_parameters():
-    print(f"Param {name} device: {param.device}")
-for name, buf in model.named_buffers():
-    print(f"Buffer {name} device: {buf.device}")
-print('--- End device check ---')
-
-# Debug: print device of each block's parameters
-for i, block in enumerate(model.deq_blocks):
-    for name, param in block.named_parameters():
-        print(f"Block {i} param {name} device: {param.device}")
 
 # Optimizer and loss
 optimizer = optim.AdamW(model.parameters(), lr=LR)
