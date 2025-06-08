@@ -54,6 +54,14 @@ import types
 model.forward = types.MethodType(forward_no_deq, model)
 model = model.to(device)  # Ensure all submodules are on the correct device after patching
 
+# Debug: print device of all parameters and buffers
+print('--- All model parameters and buffers device check ---')
+for name, param in model.named_parameters():
+    print(f"Param {name} device: {param.device}")
+for name, buf in model.named_buffers():
+    print(f"Buffer {name} device: {buf.device}")
+print('--- End device check ---')
+
 # Debug: print device of each block's parameters
 for i, block in enumerate(model.deq_blocks):
     for name, param in block.named_parameters():
