@@ -36,9 +36,9 @@ torchrun \
     --model GET-Classifier-S \
     --input_size 32 \
     --num_classes 10 \
-    --lr 1e-3 \
+    --lr 5e-4 \
     --weight_decay 1e-4 \
-    --grad_clip 1.0 \
+    --grad_clip 0.5 \
     --epochs 200 \
     --global_batch_size 256 \
     --eval_batch_size 256 \
@@ -50,9 +50,9 @@ torchrun \
     --eval_every 1000 \
     --f_solver broyden \
     --b_solver broyden \
-    --f_max_iter 30 \
-    --b_max_iter 30 \
-    --f_tol 1e-6 \
-    --b_tol 1e-6
+    --f_max_iter 15 \
+    --b_max_iter 15 \
+    --f_tol 1e-4 \
+    --b_tol 1e-4
 
 echo "Training completed at $(date)" 

@@ -218,6 +218,12 @@ def main(args):
                 loss = criterion(output, target)
                 final_output = output
             
+            # Check for NaN loss
+            if torch.isnan(loss):
+                logger.error(f"NaN loss detected at step {train_steps}!")
+                logger.error(f"Output stats: min={final_output.min():.4f}, max={final_output.max():.4f}, mean={final_output.mean():.4f}")
+                raise ValueError("Training diverged with NaN loss")
+            
             # Compute accuracy
             acc1, acc5 = accuracy(final_output, target, topk=(1, 5))
             
