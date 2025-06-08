@@ -30,6 +30,9 @@ class DummyArgs:
 args = DummyArgs()
 model = GET_Classifier_models[MODEL_NAME](args=args, input_size=INPUT_SIZE, num_classes=NUM_CLASSES).to(device)
 model.train()
+# Ensure all parameters and buffers are on the correct device
+model.cls_token = nn.Parameter(model.cls_token.data.to(device))
+model.pos_embed = nn.Parameter(model.pos_embed.data.to(device))
 
 # --- Disable DEQ: Replace model's forward with a standard transformer stack ---
 def forward_no_deq(self, x):
