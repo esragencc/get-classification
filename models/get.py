@@ -417,12 +417,16 @@ class GET_Classifier(nn.Module):
         x = x + self.pos_embed  # (B, 1+N, D)
         
         def func(z):
+            # The DEQ blocks' output is residual
+            z_out = z
             for block in self.deq_blocks:
                 if self.mem:
-                    z = mem_gc(block, (z, None, None))  # No class conditioning, no injection
+                    z_out = mem_gc(block, (z_out, None, None))  # No class conditioning, no injection
                 else:
-                    z = block(z, None, None)
-            return z
+                    z_out = block(z_out, None, None)
+
+            # Additive input injection
+            return z_out + x
         
         # DEQ forward pass with random initialization (like original GET)
         z = torch.randn_like(x)
