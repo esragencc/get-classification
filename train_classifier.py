@@ -113,8 +113,8 @@ def main(args):
     # Setup optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
-    # Setup learning rate scheduler with warmup
-    warmup_steps = 500
+    # Setup learning rate scheduler with extended warmup
+    warmup_steps = 1000
     def lr_lambda(step):
         if step < warmup_steps:
             return step / warmup_steps

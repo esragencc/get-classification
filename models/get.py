@@ -414,8 +414,8 @@ class GET_Classifier(nn.Module):
                     z = block(z, None, None)
             return z
         
-        # DEQ forward pass with input initialization
-        z_init = x * 0.1  # Start from small fraction of input
+        # DEQ forward pass with conservative initialization
+        z_init = x * 0.01  # Very small fraction of input for stability
         z_out, info = self.deq(func, z_init)
         
         if self.training:

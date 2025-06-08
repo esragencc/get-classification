@@ -36,7 +36,7 @@ torchrun \
     --model GET-Classifier-T \
     --input_size 32 \
     --num_classes 10 \
-    --lr 2e-3 \
+    --lr 5e-4 \
     --weight_decay 1e-4 \
     --grad_clip 0.5 \
     --epochs 200 \
@@ -48,10 +48,10 @@ torchrun \
     --log_every 100 \
     --ckpt_every 5000 \
     --eval_every 1000 \
-    --f_solver simple_fixed_point_iter \
-    --b_solver simple_fixed_point_iter \
-    --f_max_iter 10 \
-    --b_max_iter 10 \
+    --f_solver fixed_point_iter \
+    --b_solver fixed_point_iter \
+    --f_max_iter 3 \
+    --b_max_iter 3 \
     --f_tol 1e-3 \
     --b_tol 1e-3
 
