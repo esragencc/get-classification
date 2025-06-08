@@ -324,6 +324,109 @@ class GET(nn.Module):
             return self.decode(z_out[-1])
 
 
+class GET_Classifier(nn.Module):
+    """
+    GET architecture modified for classification - uses only DEQ transformer without injection transformer or decoder.
+    """
+    def __init__(
+        self,
+        args,
+        input_size=32,
+        patch_size=2,
+        in_channels=3,
+        hidden_size=768,
+        deq_depth=3,
+        num_heads=12,
+        deq_mlp_ratio=12.0,
+        num_classes=10,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+        self.deq_depth = deq_depth
+        self.num_classes = num_classes
+
+        # Input embedding
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        
+        num_patches = self.x_embedder.num_patches
+        # Fixed sin-cos embedding:
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        # Only DEQ blocks (no injection transformer)
+        self.deq_blocks = nn.ModuleList([
+            GETBlock(hidden_size, num_heads, mlp_ratio=deq_mlp_ratio, cond=False) for _ in range(deq_depth)
+        ])
+        
+        # Classification head instead of decoder
+        self.norm_final = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.head = nn.Linear(hidden_size, num_classes)
+        
+        self.initialize_weights()
+        
+        self.mem = args.mem
+        self.deq = get_deq(args)
+        apply_norm(self.deq_blocks, args=args)
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            if isinstance(module, nn.LayerNorm):
+                if module.weight is not None:
+                    nn.init.constant_(module.weight, 1)
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # Initialize patch embedding:
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        # Initialize classification head
+        nn.init.normal_(self.head.weight, std=0.02)
+        nn.init.constant_(self.head.bias, 0)
+
+    def forward(self, x):
+        """
+        Forward pass for classification.
+        x: (B, C, H, W) tensor of input images
+        Returns: (B, num_classes) logits
+        """
+        reset_norm(self)
+
+        # Patch embedding + positional encoding
+        x = self.x_embedder(x) + self.pos_embed     # (B, N, D)
+        
+        def func(z):
+            for block in self.deq_blocks:
+                if self.mem:
+                    z = mem_gc(block, (z, None, None))  # No class conditioning, no injection
+                else:
+                    z = block(z, None, None)
+            return z
+        
+        # DEQ forward pass
+        z_out, info = self.deq(func, x)
+        
+        if self.training:
+            # Return logits for all iterations during training
+            return [self.head(self.norm_final(z.mean(dim=1))) for z in z_out]
+        else:
+            # Return final logits for inference
+            z_final = z_out[-1]
+            z_pooled = z_final.mean(dim=1)  # Global average pooling over patches
+            return self.head(self.norm_final(z_pooled))
+
+
 #################################################################################
 #                         Current GET Configs                                   #
 #################################################################################
@@ -351,4 +454,24 @@ GET_models = {
     'GET-S/2': GET_S_2_L6_L3_H8,
     'GET-B/2': GET_B_2_L1_L3_H12,
     'GET-B/2+': GET_B_2_L6_L3_H8,
+}
+
+
+#################################################################################
+#                         GET Classifier Configs                                #
+#################################################################################
+
+def GET_Classifier_T(args, **kwargs):
+    return GET_Classifier(args, hidden_size=256, deq_depth=3, num_heads=4, deq_mlp_ratio=6, **kwargs)
+
+def GET_Classifier_S(args, **kwargs):
+    return GET_Classifier(args, hidden_size=512, deq_depth=3, num_heads=8, deq_mlp_ratio=8, **kwargs)
+
+def GET_Classifier_B(args, **kwargs):
+    return GET_Classifier(args, hidden_size=768, deq_depth=3, num_heads=12, deq_mlp_ratio=12, **kwargs)
+
+GET_Classifier_models = {
+    'GET-Classifier-T': GET_Classifier_T,
+    'GET-Classifier-S': GET_Classifier_S, 
+    'GET-Classifier-B': GET_Classifier_B,
 }

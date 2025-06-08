@@ -30,10 +30,29 @@ torchrun \
     --master_addr=$MASTER_ADDR \
     --master_port=$MASTER_PORT \
     train_classifier.py \
-    --batch_size 128 \
+    --data_path ./data \
+    --name cifar10_get_classifier \
+    --results_dir results_classifier \
+    --model GET-Classifier-S \
+    --input_size 32 \
+    --num_classes 10 \
+    --lr 1e-3 \
+    --weight_decay 1e-4 \
+    --grad_clip 1.0 \
     --epochs 200 \
-    --lr 0.001 \
-    --hidden_size 384 \
-    --output_dir checkpoints/slurm_run
+    --global_batch_size 256 \
+    --eval_batch_size 256 \
+    --global_seed 42 \
+    --num_workers 4 \
+    --mem \
+    --log_every 100 \
+    --ckpt_every 5000 \
+    --eval_every 1000 \
+    --f_solver broyden \
+    --b_solver broyden \
+    --f_max_iter 30 \
+    --b_max_iter 30 \
+    --f_tol 1e-6 \
+    --b_tol 1e-6
 
-echo "Training completed" 
+echo "Training completed at $(date)" 
