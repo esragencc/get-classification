@@ -417,7 +417,7 @@ class GET_Classifier(nn.Module):
         x = x + self.pos_embed  # (B, 1+N, D)
         
         def func(z):
-            # The DEQ blocks' output is residual
+            # The DEQ blocks' output is residual, but we pass a non-residual function to the DEQ solver
             z_out = z
             for block in self.deq_blocks:
                 if self.mem:
@@ -425,8 +425,8 @@ class GET_Classifier(nn.Module):
                 else:
                     z_out = block(z_out, None, None)
 
-            # Additive input injection
-            return z_out + x
+            # Additive input injection, and remove the residual connection of the DEQ block
+            return z_out - z + x
         
         # DEQ forward pass with random initialization (like original GET)
         z = torch.randn_like(x)
