@@ -49,7 +49,6 @@ torchrun \
     --ckpt_every 5000 \
     --eval_every 1000 \
     --f_solver anderson        \
-    --f_solver_kwargs '{"tau": 0.8, "m": 6}' \
     --f_max_iter 25 \
     --b_max_iter 25 \
     --f_tol 1e-3 \
