@@ -414,18 +414,20 @@ class GET_Classifier(nn.Module):
                     z = block(z, None, None)
             return z
         
-        # DEQ forward pass with conservative initialization
-        z_init = x * 0.01  # Very small fraction of input for stability
-        z_out, info = self.deq(func, z_init)
+        # DEQ forward pass with random initialization (like original GET)
+        z = torch.randn_like(x)
+        z_out, info = self.deq(func, z)
         
         if self.training:
-            # Return logits for all iterations during training
-            return [self.head(self.norm_final(z.mean(dim=1))) for z in z_out]
+            # Return logits for all iterations during training for fp_correction
+            return [self.head(self.norm_final(z_iter.mean(dim=1))) for z_iter in z_out]
         else:
-            # Return final logits for inference
-            z_final = z_out[-1]
-            z_pooled = z_final.mean(dim=1)  # Global average pooling over patches
-            return self.head(self.norm_final(z_pooled))
+            # Classification head on mean pooled output
+            z_final = z_out[-1]                          # (B, N, D)
+            z_final = self.norm_final(z_final)
+            pooled = z_final.mean(dim=1)                # Mean pooling over tokens
+            logits = self.head(pooled)                  # (B, num_classes)
+            return logits
 
 
 #################################################################################
