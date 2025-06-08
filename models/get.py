@@ -324,126 +324,6 @@ class GET(nn.Module):
             return self.decode(z_out[-1])
 
 
-class GET_Classifier(nn.Module):
-    """
-    GET architecture modified for classification - uses only DEQ transformer without injection transformer or decoder.
-    """
-    def __init__(
-        self,
-        args,
-        input_size=32,
-        patch_size=2,
-        in_channels=3,
-        hidden_size=768,
-        deq_depth=3,
-        num_heads=12,
-        deq_mlp_ratio=12.0,
-        num_classes=10,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.patch_size = patch_size
-        self.num_heads = num_heads
-        self.deq_depth = deq_depth
-        self.num_classes = num_classes
-
-        # Input embedding
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        
-        num_patches = self.x_embedder.num_patches
-        # Add a learnable [CLS] token
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
-        # Fixed sin-cos embedding, with extra token for [CLS]:
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + num_patches, hidden_size), requires_grad=False)
-
-        # Only DEQ blocks (no injection transformer)
-        self.deq_blocks = nn.ModuleList([
-            GETBlock(hidden_size, num_heads, mlp_ratio=deq_mlp_ratio, cond=False) for _ in range(deq_depth)
-        ])
-        
-        # Classification head instead of decoder
-        self.norm_final = nn.LayerNorm(hidden_size, eps=1e-6)
-        self.head = nn.Linear(hidden_size, num_classes)
-        
-        self.initialize_weights()
-        
-        self.mem = args.mem
-        self.deq = get_deq(args)
-        apply_norm(self.deq_blocks, args=args)
-
-    def initialize_weights(self):
-        # Initialize transformer layers:
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-            if isinstance(module, nn.LayerNorm):
-                if module.weight is not None:
-                    nn.init.constant_(module.weight, 1)
-                    nn.init.constant_(module.bias, 0)
-        self.apply(_basic_init)
-
-        # Initialize (and freeze) pos_embed by sin-cos embedding, with extra token for [CLS]:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5), cls_token=True, extra_tokens=1)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # Initialize patch embedding:
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
-
-        # Initialize classification head
-        nn.init.normal_(self.head.weight, std=0.02)
-        nn.init.constant_(self.head.bias, 0)
-
-        # Initialize [CLS] token
-        nn.init.normal_(self.cls_token, std=0.02)
-
-    def forward(self, x):
-        """
-        Forward pass for classification.
-        x: (B, C, H, W) tensor of input images
-        Returns: (B, num_classes) logits
-        """
-        reset_norm(self)
-
-        # Patch embedding + positional encoding
-        x = self.x_embedder(x)  # (B, N, D)
-        B = x.shape[0]
-        # Expand and prepend [CLS] token
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
-        x = torch.cat((cls_tokens, x), dim=1)  # (B, 1+N, D)
-        x = x + self.pos_embed  # (B, 1+N, D)
-        
-        def func(z):
-            # The DEQ blocks' output is residual, but we pass a non-residual function to the DEQ solver
-            z_out = z
-            for block in self.deq_blocks:
-                if self.mem:
-                    z_out = mem_gc(block, (z_out, None, None))  # No class conditioning, no injection
-                else:
-                    z_out = block(z_out, None, None)
-
-            # Additive input injection, and remove the residual connection of the DEQ block
-            return z_out - z + x
-        
-        # DEQ forward pass with random initialization (like original GET)
-        z = torch.randn_like(x)
-        z_out, info = self.deq(func, z)
-        
-        if self.training:
-            # Return logits for all iterations during training for fp_correction
-            return [self.head(self.norm_final(z_iter[:, 0])) for z_iter in z_out]  # Use [CLS] token
-        else:
-            # Classification head on [CLS] token output
-            z_final = z_out[-1]                          # (B, 1+N, D)
-            z_final = self.norm_final(z_final)
-            cls_token_final = z_final[:, 0]              # (B, D)
-            logits = self.head(cls_token_final)          # (B, num_classes)
-            return logits
-
-
 #################################################################################
 #                         Current GET Configs                                   #
 #################################################################################
@@ -474,18 +354,134 @@ GET_models = {
 }
 
 
+class GET_Classifier(nn.Module):
+    """
+    GET architecture modified for classification.
+    This model uses a Deep Equilibrium (DEQ) Transformer backbone for classification,
+    omitting the injection transformer and decoder from the original GET architecture.
+    """
+    def __init__(
+        self,
+        args,
+        input_size=32,
+        patch_size=2,
+        in_channels=3,
+        hidden_size=768,
+        deq_depth=3,
+        num_heads=12,
+        deq_mlp_ratio=4.0,
+        num_classes=10,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+        self.deq_depth = deq_depth
+        self.num_classes = num_classes
+
+        # Input embedding
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        
+        num_patches = self.x_embedder.num_patches
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + num_patches, hidden_size), requires_grad=False)
+
+        # DEQ blocks
+        self.deq_blocks = nn.ModuleList([
+            GETBlock(hidden_size, num_heads, mlp_ratio=deq_mlp_ratio, cond=False) for _ in range(deq_depth)
+        ])
+        
+        # Classification head
+        self.norm_final = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.head = nn.Linear(hidden_size, num_classes)
+        
+        self.initialize_weights()
+        
+        self.mem = args.mem
+        self.deq = get_deq(args)
+        apply_norm(self.deq_blocks, args=args)
+
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5), cls_token=True, extra_tokens=1)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        nn.init.normal_(self.head.weight, std=0.02)
+        nn.init.constant_(self.head.bias, 0)
+        nn.init.normal_(self.cls_token, std=0.02)
+        
+        for block in self.deq_blocks:
+            if isinstance(block, GETBlock):
+                nn.init.constant_(block.norm1.weight, 1)
+                nn.init.constant_(block.norm1.bias, 0)
+                nn.init.constant_(block.norm2.weight, 1)
+                nn.init.constant_(block.norm2.bias, 0)
+
+
+    def forward_transformer(self, z, x_emb):
+        """
+        The core transformer function whose fixed point we want to find.
+        """
+        z_out = z
+        for block in self.deq_blocks:
+            if self.mem:
+                z_out = mem_gc(block, (z_out, None, None))
+            else:
+                z_out = block(z_out, None, None)
+        # The GETBlock is residual, so z_out = z + transform(z).
+        # We want to solve z* = transform(z*) + x_emb.
+        # So we pass f(z) = (z + transform(z)) - z + x_emb = transform(z) + x_emb to the solver.
+        return z_out - z + x_emb
+
+    def forward(self, x):
+        reset_norm(self)
+
+        x_emb = self.x_embedder(x)
+        B = x_emb.shape[0]
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x_emb = torch.cat((cls_tokens, x_emb), dim=1)
+        x_emb = x_emb + self.pos_embed
+        
+        # We use x_emb as the initial guess for the fixed point
+        z0 = x_emb
+        
+        func = lambda z: self.forward_transformer(z, x_emb)
+        
+        z_out, info = self.deq(func, z0)
+        
+        if self.training:
+            # Return logits for all iterations during training for fp_correction
+            return [self.head(self.norm_final(z_iter[:, 0])) for z_iter in z_out]
+        else:
+            z_final = z_out[-1]
+            z_final = self.norm_final(z_final)
+            cls_token_final = z_final[:, 0]
+            logits = self.head(cls_token_final)
+            return logits
+
+
 #################################################################################
 #                         GET Classifier Configs                                #
 #################################################################################
 
 def GET_Classifier_T(args, **kwargs):
-    return GET_Classifier(args, hidden_size=256, deq_depth=3, num_heads=4, deq_mlp_ratio=6, **kwargs)
+    return GET_Classifier(args, hidden_size=256, deq_depth=3, num_heads=4, deq_mlp_ratio=4, **kwargs)
 
 def GET_Classifier_S(args, **kwargs):
-    return GET_Classifier(args, hidden_size=512, deq_depth=3, num_heads=8, deq_mlp_ratio=8, **kwargs)
+    return GET_Classifier(args, hidden_size=512, deq_depth=3, num_heads=8, deq_mlp_ratio=4, **kwargs)
 
 def GET_Classifier_B(args, **kwargs):
-    return GET_Classifier(args, hidden_size=768, deq_depth=3, num_heads=12, deq_mlp_ratio=12, **kwargs)
+    return GET_Classifier(args, hidden_size=768, deq_depth=3, num_heads=12, deq_mlp_ratio=4, **kwargs)
 
 GET_Classifier_models = {
     'GET-Classifier-T': GET_Classifier_T,
