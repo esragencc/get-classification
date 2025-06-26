@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --nodes=1
-#SBATCH -J get_classifier_cifar100             # job name
+#SBATCH -J get_classifier_cifar10             # job name
 #SBATCH --chdir=/home/esragenc/get-classification     # working directory
 #SBATCH --gres=gpu:2                                  # request 2 GPUs
 #SBATCH --output=/home/esragenc/get_classifier-%j.out # output file
@@ -31,13 +31,13 @@ torchrun \
     --master_port=$MASTER_PORT \
     train_classifier.py \
     --data_path ./data \
-    --name cifar100_get_classifier \
+    --name cifar10_get_classifier_improved \
     --results_dir results_classifier \
     --model GET-Classifier-T \
     --input_size 32 \
-    --num_classes 100 \
-    --lr 1e-3 \
-    --weight_decay 1e-4 \
+    --num_classes 10 \
+    --lr 3e-4 \
+    --weight_decay 5e-2 \
     --grad_clip 1.0 \
     --epochs 200 \
     --global_batch_size 256 \
