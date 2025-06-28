@@ -3,8 +3,8 @@
 #SBATCH -J get_classifier_cifar10             # job name
 #SBATCH --chdir=/home/esragenc/get-classification     # working directory
 #SBATCH --gres=gpu:2                                  # request 2 GPUs
-#SBATCH --output=/home/esragenc/get_classifier-%j.out # output file
-#SBATCH --error=/home/esragenc/get_classifier-%j.err  # error file
+#SBATCH --output=/home/esragenc/get_classifier_fixed_10-%j.out # output file
+#SBATCH --error=/home/esragenc/get_classifier_fixed_10-%j.err  # error file
 #SBATCH --time=25:00:00                              # max job time
 
 # Activate conda environment
