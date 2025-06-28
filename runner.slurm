@@ -36,10 +36,10 @@ torchrun \
     --model GET-Classifier-T \
     --input_size 32 \
     --num_classes 10 \
-    --lr 3e-4 \
-    --weight_decay 5e-2 \
+    --lr 1e-3 \
+    --weight_decay 1e-4 \
     --grad_clip 1.0 \
-    --epochs 200 \
+    --epochs 1000 \
     --global_batch_size 256 \
     --eval_batch_size 256 \
     --global_seed 42 \
@@ -48,9 +48,9 @@ torchrun \
     --log_every 100 \
     --ckpt_every 5000 \
     --eval_every 1000 \
-    --f_solver anderson        \
-    --f_max_iter 25 \
-    --b_max_iter 25 \
+    --f_solver fixed_point_iter \
+    --f_max_iter 10 \
+    --b_max_iter 10 \
     --f_tol 1e-3 \
     --b_tol 1e-3
 
