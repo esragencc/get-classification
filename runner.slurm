@@ -3,8 +3,8 @@
 #SBATCH -J get_classifier_cifar10             # job name
 #SBATCH --chdir=/home/esragenc/get-classification     # working directory
 #SBATCH --gres=gpu:2                                  # request 2 GPUs
-#SBATCH --output=/home/esragenc/get_classifier_simple_fixed_10-%j.out # output file
-#SBATCH --error=/home/esragenc/get_classifier_simple_fixed_10-%j.err  # error file
+#SBATCH --output=/home/esragenc/get_classifier_anderson_8-%j.out # output file
+#SBATCH --error=/home/esragenc/get_classifier_anderson_8-%j.err  # error file
 #SBATCH --time=25:00:00                              # max job time
 
 # Activate conda environment
@@ -36,10 +36,10 @@ torchrun \
     --model GET-Classifier-T \
     --input_size 32 \
     --num_classes 10 \
-    --lr 1e-3 \
-    --weight_decay 1e-4 \
+    --lr 5e-4 \
+    --weight_decay 5e-4 \
     --grad_clip 1.0 \
-    --epochs 1000 \
+    --epochs 500 \
     --global_batch_size 256 \
     --eval_batch_size 256 \
     --global_seed 42 \
@@ -49,8 +49,8 @@ torchrun \
     --ckpt_every 5000 \
     --eval_every 1000 \
     --f_solver simple_fixed_point_iter \
-    --f_max_iter 10 \
-    --b_max_iter 10 \
+    --f_max_iter 8 \
+    --b_max_iter 8 \
     --f_tol 1e-3 \
     --b_tol 1e-3
 

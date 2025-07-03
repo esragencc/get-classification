@@ -42,7 +42,7 @@ def parse_log_file(filepath):
 
     return train_df, test_df
 
-def plot_metrics(train_df, test_df, output_dir='plots'):
+def plot_metrics(train_df, test_df, log_file, output_dir='plots'):
     """
     Generates and saves plots for training and testing metrics.
     """
@@ -59,9 +59,9 @@ def plot_metrics(train_df, test_df, output_dir='plots'):
     plt.xlabel('Steps')
     plt.ylabel('Loss')
     plt.legend()
-    plt.savefig(os.path.join(output_dir, 'loss_vs_steps.png'))
+    plt.savefig(os.path.join(output_dir, log_file + '_loss.png'))
     plt.close()
-    print(f"Saved loss plot to {os.path.join(output_dir, 'loss_vs_steps.png')}")
+    print(f"Saved loss plot to {os.path.join(output_dir, log_file + '_loss.png')}")
 
     # Plot 2: Accuracy (Train vs. Test)
     plt.figure(figsize=(12, 6))
@@ -75,9 +75,9 @@ def plot_metrics(train_df, test_df, output_dir='plots'):
     plt.xlabel('Steps')
     plt.ylabel('Accuracy (%)')
     plt.legend()
-    plt.savefig(os.path.join(output_dir, 'accuracy_vs_steps.png'))
+    plt.savefig(os.path.join(output_dir, log_file + '_acc.png'))
     plt.close()
-    print(f"Saved accuracy plot to {os.path.join(output_dir, 'accuracy_vs_steps.png')}")
+    print(f"Saved accuracy plot to {os.path.join(output_dir, log_file + '_acc.png')}")
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze a CIFAR-10 training log file and generate plots.")
@@ -95,7 +95,7 @@ def main():
         print("Could not find training or testing data in the log file.")
         return
         
-    plot_metrics(train_df, test_df, args.output_dir)
+    plot_metrics(train_df, test_df, args.log_file, args.output_dir)
 
 if __name__ == '__main__':
     main() 
